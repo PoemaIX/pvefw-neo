@@ -208,8 +208,50 @@ def flush_ruleset():
     print("Flushed all pvefw-neo state (nftables + OVS)")
 
 
+def snapshot_ovs_ports():
+    """Snapshot {bridge: {portname: ofport}} for all OVS bridges.
+
+    Used to detect ofport reassignment (VM stop/start, live migrate).
+    Returns empty dict if OVS not present or no bridges.
+    """
+    snapshot = {}
+    ret = subprocess.run(
+        ["ovs-vsctl", "list-br"],
+        capture_output=True, text=True,
+    )
+    if ret.returncode != 0:
+        return snapshot
+
+    for br in ret.stdout.strip().splitlines():
+        br = br.strip()
+        if not br:
+            continue
+        ports = {}
+        ret2 = subprocess.run(
+            ["ovs-vsctl", "list-ports", br],
+            capture_output=True, text=True,
+        )
+        if ret2.returncode != 0:
+            continue
+        for port in ret2.stdout.strip().splitlines():
+            port = port.strip()
+            if not port:
+                continue
+            ret3 = subprocess.run(
+                ["ovs-vsctl", "get", "Interface", port, "ofport"],
+                capture_output=True, text=True,
+            )
+            if ret3.returncode == 0:
+                try:
+                    ports[port] = int(ret3.stdout.strip())
+                except ValueError:
+                    pass
+        snapshot[br] = ports
+    return snapshot
+
+
 def daemon_loop():
-    """Main daemon loop with inotify watch."""
+    """Main daemon loop: inotify (.fw/.conf) + OVS port polling."""
     try:
         import inotify.adapters
     except ImportError:
@@ -224,6 +266,10 @@ def daemon_loop():
     ir_rs, nft_text, iso_devs, ovs_groups = generate_and_check()
     if nft_text is not None:
         apply_ruleset(ir_rs, nft_text, iso_devs, ovs_groups)
+    _last_nft_text = nft_text
+
+    # Snapshot OVS ports for change detection
+    ovs_snapshot = snapshot_ovs_ports()
 
     # Watch for changes
     i = inotify.adapters.Inotify()
@@ -234,25 +280,54 @@ def daemon_loop():
         if os.path.isdir(d):
             i.add_watch(d)
 
-    last_apply = time.time()
-    pending = False
+    last_event_time = 0   # When the most recent triggering event arrived
+    last_ovs_check = time.time()
+    pending = False       # True when a re-apply is needed
+    ovs_changed = False   # True if OVS topology changed since last apply
+    DEBOUNCE_SECONDS = 2
+    OVS_POLL_INTERVAL = 10
 
     for event in i.event_gen(yield_nones=True):
-        if event is None:
-            if pending and time.time() - last_apply > 2:
-                # Debounce: apply after 2s of quiet
-                ir_rs, nft_text, iso_devs, ovs_groups = generate_and_check()
-                if nft_text is not None:
-                    apply_ruleset(ir_rs, nft_text, iso_devs, ovs_groups)
-                last_apply = time.time()
-                pending = False
-            continue
+        now = time.time()
 
-        (_, type_names, path, filename) = event
-        if not filename:
-            continue
-        if filename.endswith(".fw") or filename.endswith(".conf"):
-            pending = True
+        # ── Periodic OVS port check ──
+        if now - last_ovs_check >= OVS_POLL_INTERVAL:
+            last_ovs_check = now
+            new_snapshot = snapshot_ovs_ports()
+            if new_snapshot != ovs_snapshot:
+                print("OVS port topology changed, scheduling re-apply")
+                ovs_snapshot = new_snapshot
+                pending = True
+                ovs_changed = True   # bypass nft no-op skip
+                last_event_time = now
+
+        # ── inotify event ──
+        if event is not None:
+            (_, type_names, path, filename) = event
+            # Only react to write/move events. Reads are ignored: pvefw-neo's
+            # own compile_ir() reads .fw files, generating IN_OPEN/IN_ACCESS
+            # events that would otherwise feed back into this loop.
+            WRITE_EVENTS = {"IN_CLOSE_WRITE", "IN_MODIFY",
+                            "IN_MOVED_TO", "IN_DELETE", "IN_CREATE"}
+            if (filename
+                    and (filename.endswith(".fw") or filename.endswith(".conf"))
+                    and any(t in WRITE_EVENTS for t in type_names)):
+                pending = True
+                last_event_time = now
+
+        # ── Apply check ──
+        # Run on every iteration (event or None) so filtered-out events
+        # don't starve the apply check.
+        if pending and (now - last_event_time) >= DEBOUNCE_SECONDS:
+            ir_rs, nft_text, iso_devs, ovs_groups = generate_and_check()
+            # Apply if nft text changed OR OVS topology changed
+            if nft_text is not None and (nft_text != _last_nft_text or ovs_changed):
+                print(f"Reloading after {DEBOUNCE_SECONDS}s of quiet...")
+                apply_ruleset(ir_rs, nft_text, iso_devs, ovs_groups)
+                _last_nft_text = nft_text
+            ovs_snapshot = snapshot_ovs_ports()
+            pending = False
+            ovs_changed = False
 
 
 def _poll_loop():

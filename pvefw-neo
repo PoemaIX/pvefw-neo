@@ -1,5 +1,8 @@
-#!/usr/bin/python3
-"""pvefw-neo launcher."""
+#!/usr/bin/python3 -u
+"""pvefw-neo launcher.
+
+Note: -u disables stdout/stderr buffering so daemon log shows immediately.
+"""
 
 import os
 import sys
