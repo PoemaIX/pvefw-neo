@@ -1,0 +1,16 @@
+[Unit]
+Description=pvefw-neo nftables firewall manager for Proxmox VE
+After=network.target pve-cluster.service
+Wants=pve-cluster.service
+Conflicts=pve-firewall.service proxmox-firewall.service
+
+[Service]
+Type=simple
+ExecStartPre=/usr/local/bin/pvefw-neo --preflight-check
+ExecStart=/usr/local/bin/pvefw-neo --daemon
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
