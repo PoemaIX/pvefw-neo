@@ -1,7 +1,9 @@
 # pvefw-neo Design Document
 
-> **Version**: 3.0 — 2026-04-11
-> **Status**: Draft for review before implementation
+> **Version**: 4.0 — 2026-04-12
+> **Status**: Implemented + tested. Production-ready.
+
+> 📖 安裝/使用說明請見 [README.md](README.md) (English) 或 [README.zh_TW.md](README.zh_TW.md) (繁體中文)
 
 ---
 
@@ -463,64 +465,110 @@ oifname "tap100i0" drop
 
 ## 7. 整體架構
 
+### 7.1 Pipeline (parser → compiler → IR → backend)
+
+pvefw-neo 採用三層架構，IR (Intermediate Representation) 是後端無關的中間表示：
+
 ```
 ┌──────────────────────────────────────┐
-│  PVE WebUI → VM → Firewall Tab       │
-│  使用者編輯規則                       │
-│  （正常規則 + Finger dummy + comment）│
+│  PVE WebUI / 直接編輯 .fw 檔案        │
 └──────────┬───────────────────────────┘
            │ writes
            ▼
 ┌──────────────────────────────────────┐
-│  /etc/pve/firewall/                  │
-│    cluster.fw                        │
-│    <vmid>.fw                         │
+│  /etc/pve/firewall/{cluster,*}.fw    │
+│  /etc/pve/{qemu-server,lxc}/*.conf   │
 └──────────┬───────────────────────────┘
-           │ reads (inotify + periodic)
+           │ inotify (write events) + OVS port poll (10s)
            ▼
-┌──────────────────────────────────────┐
-│  pvefw-neo daemon（Python 3）         │
-│  ┌────────────────────────────────┐  │
-│  │ 1. Parse .fw files            │  │
-│  │ 2. Parse @neo: tags           │  │
-│  │ 3. Expand sugar tags          │  │
-│  │ 4. Resolve aliases/ipsets/SG  │  │
-│  │ 5. Parse Firewall.pm macros   │  │
-│  │ 6. Map vNIC → tap/veth devs   │  │
-│  │ 7. Generate nftables ruleset  │  │
-│  │ 8. Atomic apply (nft -f)      │  │
-│  │ 9. Apply bridge isolation     │  │
-│  └────────────────────────────────┘  │
-│                                      │
-│  依賴：python3, python3-nftables     │
-│  不使用 pip install                  │
-└──────────────────────────────────────┘
-           │ applies
-           ▼
-┌──────────────────────────────────────┐
-│  nftables kernel                     │
-│                                      │
-│  ┌─ table netdev pvefw-neo-tapXiY ─┐ │
-│  │  chain ingress（per-device）     │ │
-│  │  → @neo:macspoof                │ │
-│  │  → @neo:mcast_limit            │ │
-│  └─────────────────────────────────┘ │
-│                                      │
-│  ┌─ table bridge pvefw-neo ────────┐ │
-│  │                                 │ │
-│  │  chain raw_prerouting (-300)    │ │
-│  │  → @neo:ipspoof 展開            │ │
-│  │  → @neo:nodhcp / nora / nondp  │ │
-│  │  → @neo:notrack 規則            │ │
-│  │                                 │ │
-│  │  chain forward (0)              │ │
-│  │  → ct state established,related│ │
-│  │  → 原生 stateful 規則           │ │
-│  │  → @neo:isolated               │ │
-│  │  → default policy              │ │
-│  └─────────────────────────────────┘ │
-└──────────────────────────────────────┘
+┌──────────────────────────────────────────────────────┐
+│  pvefw-neo daemon (systemd, Python 3)                │
+│                                                      │
+│  ┌─ parser.py ───────────────────────────────────┐  │
+│  │  解析 .fw / .conf：rules, ALIASES, IPSET,      │  │
+│  │  security groups, @neo: tags                   │  │
+│  └────────────┬───────────────────────────────────┘  │
+│               ▼                                      │
+│  ┌─ compiler.py ─────────────────────────────────┐  │
+│  │  • 展開 sugar tags (@neo:ipspoof 等)          │  │
+│  │  • 解析 alias / ipset / security group        │  │
+│  │  • 套用 macros (Firewall.pm)                   │  │
+│  │  • policy_in/out → 顯式 catch-all rule         │  │
+│  │  • 輸出 IR (Ruleset)                           │  │
+│  └────────────┬───────────────────────────────────┘  │
+│               ▼                                      │
+│  ┌─ ir.py: Ruleset (後端無關) ───────────────────┐  │
+│  │  netdevs: dict[devname → NetDev]              │  │
+│  │    └─ rules: list[Rule]                        │  │
+│  │       └─ phase, direction, match, action       │  │
+│  │  sets: dict[name → NamedSet]                  │  │
+│  └────────────┬───────────────────────────────────┘  │
+│               │                                      │
+│        detect_bridge() per netdev                    │
+│        ┌──────┴──────┐                               │
+│        ▼             ▼                               │
+│  ┌─ nftgen.py ─┐  ┌─ ovsgen.py ─┐                   │
+│  │ Linux       │  │ OVS bridge  │                   │
+│  │ bridge ports│  │ ports       │                   │
+│  └──────┬──────┘  └──────┬──────┘                   │
+└─────────┼────────────────┼──────────────────────────┘
+          │                │
+          ▼                ▼
+       nft -f       ovs-ofctl add-flows
 ```
+
+### 7.2 IR 設計原則
+
+| 原則 | 說明 |
+|------|------|
+| **後端無關** | IR 不知道 nftables / OVS 的存在，只描述「規則語意」 |
+| **per-NetDev 主軸** | `Ruleset.netdevs[devname]` 為主結構，規則歸屬於某個 netdev |
+| **二元 Phase** | `STATELESS` (notrack/sugar 防護) vs `STATEFUL` (普通 firewall)，由 backend 自行決定 hook 點 |
+| **Match 結構化** | nested dict `{"l2":{...}, "l3":{...}, "l4":{...}}` |
+| **沒有 jump/goto** | backend 自己決定要組成什麼 chain 結構 |
+| **沒有隱式 default policy** | 沒規則 = 雙向 accept；`policy_in: DROP` 由 compiler 翻譯成顯式 catch-all rule |
+| **isolated 是 NetDev 屬性** | 不是規則，由 backend 各自實作（kernel flag / OF rule） |
+
+### 7.3 核心資料結構
+
+```python
+@dataclass
+class Rule:
+    direction: Direction      # OUT (iif=devname) / IN (oif=devname or dl_dst=mac)
+    phase: Phase              # STATELESS / STATEFUL
+    match: dict               # {l2:{...}, l3:{...}, l4:{...}}
+    action: str               # "accept" / "drop"
+    rate_limit_pps: int = None
+    comment: str = ""
+
+@dataclass
+class NetDev:
+    devname: str              # tap100i0 / veth100i0
+    mac: str                  # for IN-direction match (dl_dst on OVS)
+    vmid: int
+    iface: str                # "net0" — PVE 內部 NIC 名
+    isolated: bool = False    # Linux bridge isolated 旗標
+    rules: list = field(default_factory=list)
+
+@dataclass
+class Ruleset:
+    netdevs: dict             # devname → NetDev
+    sets: dict                # set_name → NamedSet
+```
+
+### 7.4 Backend 自動派發
+
+`main.py` 在 apply 時呼叫 `detect_bridge(devname)`：
+
+1. 讀 `/sys/class/net/<dev>/master` 找出 master bridge
+2. 若 master 是 `ovs-system` → 用 `ovs-vsctl iface-to-br` 找實際 OVS bridge → `bridge_type="ovs"`
+3. 否則 → `bridge_type="linux"`
+
+然後按 bridge type 分組：
+- **Linux bridge ports** → 一次 `nftgen.render()` → `nft -f`
+- **OVS bridge ports**（每個 OVS bridge 各一份）→ `ovsgen.apply(bridge, devs)` → `ovs-ofctl add-flows`
+
+同一台 VM 的 net0 在 vmbr1 (Linux)、net1 在 vmbr2 (OVS) 是合法的，會自動分流到兩個 backend。
 
 ---
 
@@ -662,57 +710,61 @@ table bridge pvefw-neo {
 
     # ── forward: stateful rules ──
     chain forward {
-        type filter hook forward priority filter; policy drop;
+        type filter hook forward priority filter; policy accept;
 
-        # conntrack
+        # ARP pass-through (essential for L2 learning)
+        ether type arp accept
+
+        # conntrack framework
         ct state established,related accept
         ct state invalid drop
 
-        # per-port dispatch
-        iifname "tap100i0" goto vm100_net0_out
-        oifname "tap100i0" goto vm100_net0_in
+        # per-port dispatch:
+        # OUT uses 'jump' so the OUT chain returns control to forward
+        # after evaluation, allowing the IN check to also fire for
+        # VM-to-VM traffic.
+        # IN uses 'goto' as the final verdict.
+        iifname "tap100i0" jump vm_tap100i0_out
+        oifname "tap100i0" goto vm_tap100i0_in
 
-        iifname "tap100i1" goto vm100_net1_out
-        oifname "tap100i1" goto vm100_net1_in
+        iifname "tap100i1" jump vm_tap100i1_out
+        oifname "tap100i1" goto vm_tap100i1_in
 
-        # @neo:isolated (net2)
-        iifname "tap100i2" oifname "tap*"  drop
-        iifname "tap100i2" oifname "veth*" drop
-
-        # net2: no explicit stateful rules → default policy
-        # iifname "tap100i2" accept (policy_out)
-        # oifname "tap100i2" drop   (policy_in)
+        # net2: @neo:isolated handled by Linux bridge kernel flag
+        # (bridge link set dev tap100i2 isolated on), not nft rules.
     }
 
     # ── per-port stateful rule chains ──
 
-    chain vm100_net0_in {
+    chain vm_tap100i0_in {
         # |IN SSH(ACCEPT) -source 10.0.0.0/24 -i net0
         ether type ip ip saddr 10.0.0.0/24 meta l4proto tcp tcp dport 22 accept
         # |IN HTTPS(ACCEPT) -source 10.0.0.0/24 -i net0
         ether type ip ip saddr 10.0.0.0/24 meta l4proto tcp tcp dport 443 accept
-        # policy_in: DROP
+        # policy_in: DROP — explicit catch-all from compiler
         drop
     }
 
-    chain vm100_net0_out {
-        # |OUT ACCEPT
-        accept
+    chain vm_tap100i0_out {
+        # |OUT ACCEPT — converted to 'return' so IN check still runs
+        return
     }
 
-    chain vm100_net1_in {
+    chain vm_tap100i1_in {
         # |IN BGP(ACCEPT) -i net1
         meta l4proto tcp tcp dport 179 accept
-        # policy_in: DROP
         drop
     }
 
-    chain vm100_net1_out {
-        # |OUT ACCEPT
-        accept
+    chain vm_tap100i1_out {
+        return
     }
 }
 ```
+
+> **NetDevs without STATEFUL rules** are skipped from the forward chain
+> dispatch entirely. Their packets fall through (forward chain default
+> policy = `accept`) without entering conntrack, avoiding the overhead.
 
 ---
 
@@ -818,15 +870,55 @@ def parse_firewall_pm(path="/usr/share/perl5/PVE/Firewall.pm"):
 
 ```bash
 apt install python3-nftables python3-inotify
+# OVS backend (optional)
+apt install openvswitch-switch
 ```
 
-| 套件 | 用途 |
-|------|------|
-| `python3` | 標準函式庫（系統自帶） |
-| `python3-nftables` | nftables Python binding（`import nftables`） |
-| `python3-inotify` | inotify filesystem watcher（`import inotify.adapters`） |
+| 套件 | 用途 | 必須 |
+|------|------|------|
+| `python3` | 標準函式庫 | ✅ |
+| `python3-nftables` | nftables Python binding | ✅ |
+| `python3-inotify` | inotify filesystem watcher | ✅ |
+| `openvswitch-switch` | 提供 `ovs-vsctl` / `ovs-ofctl`；只在使用 OVS bridge 時需要 | ⚠️ |
 
-**遵守 PEP 668，不使用 `pip install`。** 所有依賴透過 `apt` 安裝系統套件。
+**遵守 PEP 668**：所有依賴透過 `apt` 安裝系統套件，不用 `pip install`。
+
+### 10.2 自動 reload 機制
+
+daemon 同時用兩個機制偵測變動：
+
+#### A. inotify 監聽 .fw / .conf
+
+監聽路徑：
+- `/etc/pve/firewall/` (cluster.fw, *.fw)
+- `/etc/pve/qemu-server/` (*.conf — VM 設定)
+- `/etc/pve/lxc/` (*.conf — CT 設定)
+
+**只看 write 類事件**（`IN_CLOSE_WRITE`, `IN_MODIFY`, `IN_MOVED_TO`, `IN_DELETE`, `IN_CREATE`），過濾 read 事件。
+原因：daemon 的 `compile_ir()` 自己會 read 這些檔案，如果不過濾就會 feedback loop。
+
+事件觸發後 **2 秒 debounce** 合併連續變動，再執行 reload。
+
+#### B. OVS port topology polling (每 10 秒)
+
+OVS flow 用 ofport 數字 key，當 VM stop/start 後 ofport 會重新分配，舊 flow 變成 dangling。
+nftables 沒有此問題（`iifname/oifname` 在封包評估時解析）。
+
+daemon 每 10 秒呼叫 `ovs-vsctl list-ports + get Interface ... ofport`，比對 snapshot。
+變動 → 觸發 reload。
+
+#### Apply check 邏輯
+
+```python
+if pending and (now - last_event_time) >= 2:
+    # Generate new IR
+    new_nft = nftgen.render(ir_rs, linux_devs)
+    # Skip apply if nft text unchanged AND OVS topology unchanged
+    if new_nft != last_nft_text or ovs_changed:
+        apply_ruleset(...)
+```
+
+**no-op skip** 避免無謂的 `nft -f`（PVE 內部會 touch 檔案但內容沒變），但 OVS 變動會 bypass 這個 skip。
 
 ### 10.3 systemd service
 
@@ -849,38 +941,130 @@ RestartSec=5
 WantedBy=multi-user.target
 ```
 
+Launcher (`pvefw-neo`) 用 `#!/usr/bin/python3 -u` 確保 stdout 不 buffer，log 即時出現在 journalctl。
+
 ### 10.4 Preflight check
 
 拒絕啟動的條件：
-
 - `pve-firewall.service` 仍在運行
 - `proxmox-firewall.service` 仍在運行
 - `cluster.fw` 中 `[OPTIONS]` 的 `enable: 1`
 
 ### 10.5 Atomic apply
 
-生成 `.nft` 文字檔，用 `nft -f` 原子載入。
-語法檢查用 `nft -c -f`。
+- **nftables**：生成 `.nft` 文字檔，先 `nft -c -f` 語法檢查，再 `nft -f` 原子載入
+- **OVS**：用 cookie `0x4E30` 標記自己的 flow，apply 前 `ovs-ofctl del-flows cookie=0x4E30/-1`，然後 `ovs-ofctl add-flows`
+- **Bridge isolation**：reconcile 模式 — 每次 apply 把所有非 isolated 的 linux bridge port 設為 `isolated off`，然後把該 isolated 的設為 `on`，避免 stale state
 
 ---
 
 ## 11. 檔案配置
 
+### 11.1 安裝後的路徑
+
 ```
-/usr/local/bin/pvefw-neo                # launcher script
-/usr/local/lib/pvefw-neo/               # Python modules
-    __init__.py
-    main.py                              # CLI + daemon loop
-    parser.py                            # .fw parser + @neo: tag parser
-    macros.py                            # Firewall.pm macro parser + fallback
-    vmdevs.py                            # VM device discovery
-    nftgen.py                            # nftables ruleset generator
-    bridge.py                            # bridge isolation
-/etc/systemd/system/pvefw-neo.service
+/usr/local/lib/pvefw_neo/                 # git repo (clone 或 dev symlink)
+├── pvefw-neo                              # launcher script
+├── pvefw-neo.service                      # systemd unit
+├── pvefw_neo_src/                         # Python package
+│   ├── __init__.py
+│   ├── ir.py                              # IR 定義
+│   ├── parser.py                          # .fw / @neo: tag 解析
+│   ├── macros.py                          # Firewall.pm macro 解析 + fallback
+│   ├── vmdevs.py                          # VM/CT device discovery
+│   ├── compiler.py                        # parser 輸出 → IR
+│   ├── nftgen.py                          # IR → nftables (linux bridge)
+│   ├── ovsgen.py                          # IR → OVS flows
+│   ├── bridge.py                          # bridge isolation reconcile
+│   └── main.py                            # CLI + daemon loop
+├── tests/
+│   ├── setup.sh
+│   ├── run_tests.sh                       # 36 個 nft 功能測試
+│   ├── run_isolation_tests.sh             # 12 個 isolation 測試
+│   └── teardown.sh
+├── install.sh / upgrade.sh / uninstall.sh
+└── DESIGN.md / README.md / README.zh_TW.md
+
+/usr/local/bin/pvefw-neo                  → symlink → /usr/local/lib/pvefw_neo/pvefw-neo
+/etc/systemd/system/pvefw-neo.service     → symlink → /usr/local/lib/pvefw_neo/pvefw-neo.service
+
 /run/pvefw-neo/
-    ruleset.nft                          # last applied ruleset
-    state.json                           # current state
+├── ruleset.nft                           # 最近一次的 nftables 規則
+├── ovs-<bridge>.flows                    # 最近一次的 OVS flows (per bridge)
+└── state.json                            # 套用狀態
 ```
+
+### 11.2 內部模組依賴
+
+```
+parser ──┐
+         ├──> compiler ──> ir ──┬──> nftgen ──> nft -f
+macros ──┤                     │
+         │                     └──> ovsgen ──> ovs-ofctl
+vmdevs ──┘
+
+main: orchestration (CLI, daemon loop, backend dispatch)
+bridge: external — kernel bridge isolated flag reconcile
+```
+
+`ir.py` 是中心，所有 backend 只認 IR，不認 parser 內部結構。新增 backend (例如 eBPF / VPP) 只需要寫一個新的 `*gen.py` 消費 `ir.Ruleset`。
+
+---
+
+## 11.5 OVS Backend Pipeline
+
+OVS bridge 完全用 OpenFlow 規則實作，不依賴 Linux netfilter。
+
+### Pipeline (5 個 OF tables)
+
+```
+封包進入 OVS bridge
+   ↓
+[Table 0: Ingress macfilter]
+  • per in_port, dl_src 比對 (macspoof)
+  • 不符 → drop
+  • 符合 → resubmit(,10)
+   ↓
+[Table 10: Stateless filter]
+  • per in_port, ipspoof / nodhcp / nora / @neo:notrack ACL
+  • drop 或 resubmit(,20)
+   ↓
+[Table 20: Conntrack send]
+  • arp → resubmit(,30)              ← ARP 不走 ct
+  • ip  → ct(table=30)               ← 進 conntrack zone
+  • ipv6 → ct(table=30)
+   ↓
+[Table 30: Forward OUT check]
+  • per in_port stateful OUT 規則
+  • 沒 match → resubmit(,31)
+   ↓
+[Table 31: Forward IN check]
+  • arp → NORMAL
+  • ct_state=+est → NORMAL           ← reply packets 短路
+  • ct_state=+rel → NORMAL
+  • ct_state=+inv → drop
+  • per dl_dst stateful IN 規則 → ct(commit),NORMAL
+  • 預設 → NORMAL (沒 STATEFUL 規則 = 透通)
+```
+
+### 跟 nftables 的差異
+
+| 概念 | nftables | OVS |
+|------|---------|-----|
+| 介面比對 | `iifname/oifname` (字串，封包評估時解析) | `in_port` (數字，flow 安裝時綁定) |
+| IN 方向 match | `oifname "tap100i0"` | `dl_dst=<vm_mac>` (因為 OVS 沒辦法 match output port) |
+| Named set | nft set + `@setname` 引用 | 必須展開成 N 條 flows |
+| `arp_op` 多值 | `arp operation { request, reply }` 一條 | 必須拆成兩條 flow（OVS 只能 match 單值） |
+| Conntrack | hook 自動進 conntrack | 必須顯式 `ct(table=N)` 和 `ct(commit)` |
+| isolated | kernel `bridge link set isolated on` | reg0[0] mark + dl_dst drop（語意 A 模擬） |
+
+### Port lifecycle 處理
+
+OVS ofport 在 VM stop/start 時會重新分配，舊 flow 變成 dangling。daemon 用 10 秒 polling 偵測這個情況（見 §10.2）。
+
+### Cookie
+
+所有 pvefw-neo 安裝的 flow 帶 `cookie=0x4E30`（"NE0" 編碼），以便用 `del-flows cookie=0x4E30/-1` 一次清除自己的 flow，不影響其他控制器的 flow。
 
 ---
 
@@ -908,23 +1092,56 @@ WantedBy=multi-user.target
 
 ---
 
-## 14. 實作優先順序
+## 13.5 與官方 proxmox-firewall 的對比（詳細）
 
-### Phase 1：核心
-- [ ] parser.py：.fw 解析 + @neo: tag 解析
-- [ ] macros.py：Firewall.pm 解析 + fallback
-- [ ] vmdevs.py：VM device discovery
-- [ ] nftgen.py：bridge family ruleset 產生
-- [ ] main.py：CLI `--dry-run`
+| 功能 | proxmox-firewall (官方) | pvefw-neo |
+|------|------------------------|-----------|
+| 後端 | nftables only | nftables + OVS |
+| Per-port rules | ❌ per-VM | ✅ per-port (per vNIC) |
+| NOTRACK | ❌ 全 conntrack | ✅ per-rule (`@neo:notrack`) |
+| 非對稱路由 | ❌ conntrack drop invalid | ✅ STATELESS rules 繞過 ct |
+| Multicast ratelimit | ❌ | ✅ `@neo:mcast_limit` |
+| Port isolation | ❌ | ✅ `@neo:isolated` (語意 A) |
+| MAC spoof per-port | ❌ per-VM | ✅ `@neo:macspoof` per-vNIC |
+| IP spoof per-port | ❌ per-VM | ✅ `@neo:ipspoof` per-vNIC + 自帶 ARP/NDP 防護 |
+| OVS bridge | ❌ | ✅ |
+| 修改 PVE code | ✅ Rust 改 PVE 內部 | ❌ 完全外部，只讀 .fw |
 
-### Phase 2：daemon + sugar
-- [ ] sugar tag 展開（ipspoof, macspoof, nodhcp, nora, nondp）
-- [ ] inotify watch（python3-inotify）
-- [ ] systemd service
-- [ ] `--apply` mode
+---
 
-### Phase 3：進階
-- [ ] mcast_limit（netdev ingress）
-- [ ] isolated（bridge + kernel）
-- [ ] rollback timer
-- [ ] alias / ipset / security group 完整支援
+## 14. 實作狀態
+
+### Phase 1：核心 ✅
+- [x] `parser.py`：.fw 解析 + @neo: tag 解析 + ALIASES + IPSET + GROUP
+- [x] `macros.py`：Firewall.pm runtime 解析 + hardcoded fallback
+- [x] `vmdevs.py`：VM/CT device discovery（tap/veth, MAC, bridge）
+- [x] `compiler.py`：parser → IR
+- [x] `ir.py`：後端無關中間表示
+- [x] `nftgen.py`：IR → nftables (linux bridge)
+- [x] `main.py`：CLI `--dry-run` / `--apply` / `--dump-ir`
+
+### Phase 2：daemon + sugar ✅
+- [x] Sugar tag 展開：`@neo:macspoof`, `ipspoof`, `nodhcp`, `nora`, `nondp`
+- [x] inotify watch (`/etc/pve/firewall/`, `/etc/pve/{qemu-server,lxc}/`)
+- [x] 2 秒 debounce
+- [x] systemd service + preflight check
+- [x] `--apply` 自動 backend dispatch
+
+### Phase 3：進階 ✅
+- [x] `@neo:mcast_limit` (netdev ingress rate limit)
+- [x] `@neo:isolated` (kernel `bridge link isolated`)
+- [x] alias / ipset / security group 完整支援
+- [x] OVS backend (`ovsgen.py`)
+- [x] OVS port topology polling (10 秒)
+- [x] `@neo:isolated` 在 OVS 用 reg0 mark + dl_dst drop 模擬
+
+### 測試覆蓋
+
+| 測試套件 | 數量 | 狀態 |
+|---------|------|------|
+| nft functional + structural | 36 | ✅ all pass |
+| OVS functional | 4 | ✅ all pass |
+| Isolation (Linux + OVS) | 12 | ✅ all pass |
+| **總計** | **52** | |
+
+測試腳本：`tests/run_tests.sh`, `tests/run_isolation_tests.sh`
