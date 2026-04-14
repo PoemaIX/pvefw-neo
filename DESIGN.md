@@ -404,6 +404,7 @@ ether type != 8021q
 | `@neo:nondp` | 語法糖 | ✅ enable=0 | bridge raw | 禁止發 NDP |
 | `@neo:mcast_limit <pps>` | 功能 | ✅ enable=0 | netdev ingress | multicast ratelimit |
 | `@neo:isolated` | 功能 | ✅ enable=0 | bridge fwd + kernel | port isolation |
+| `@neo:disable` | 功能 | ✅ enable=0 | 跳過整個 port | debug：該 port 完全不處理 |
 | `@neo:notrack` | 原語 | ❌ 正常規則 | bridge raw | 規則走 raw chain |
 | `@neo:mac <src> [dst]` | 原語 | ❌ 正常規則 | 隨所附加規則 | 加 MAC match 條件 |
 | `@neo:vlan <vid\|untagged>` | 原語 | ❌ 正常規則 | 隨所附加規則 | 加 VLAN match 條件 |
@@ -943,12 +944,111 @@ WantedBy=multi-user.target
 
 Launcher (`pvefw-neo`) 用 `#!/usr/bin/python3 -u` 確保 stdout 不 buffer，log 即時出現在 journalctl。
 
-### 10.4 Preflight check
+### 10.4 Preflight check — node-off + nftables-mode 共存模型
 
-拒絕啟動的條件：
-- `pve-firewall.service` 仍在運行
-- `proxmox-firewall.service` 仍在運行
-- `cluster.fw` 中 `[OPTIONS]` 的 `enable: 1`
+pvefw-neo 允許跟 PVE 原生防火牆在同一個 cluster 共存：這台 node 由
+pvefw-neo 管，其他 node 可繼續跑 PVE 原生防火牆。
+
+**拒絕啟動條件**（只看本機 `host.fw`）：
+
+- `/etc/pve/nodes/<this>/host.fw` 的 `[OPTIONS] enable != 0`
+- `/etc/pve/nodes/<this>/host.fw` 的 `[OPTIONS] nftables != 1`
+
+**不再檢查的項目**（舊版本會擋，新版不擋）：
+
+- ~~`cluster.fw [OPTIONS] enable` 不能是 1~~ — 現在允許，由使用者決定
+- ~~`pve-firewall.service` 不能 active~~ — 可跑，它在 nftables mode 會 defer
+- ~~`proxmox-firewall.service` 不能 active~~ — 可跑，host.enable=0 時它跳過這台 node
+
+**為什麼這兩個條件就夠了**：
+
+| 情境 | PVE 行為 | pvefw-neo 影響 |
+|------|---------|---------------|
+| `host.enable=0` + `nftables=1` | Perl `pve-firewall` 在 `is_enabled_and_not_nftables()` 回 false → 移除自己的 iptables chains 然後 `return`。Rust `proxmox-firewall` 看到 `host.enable=0` 就跳過這台 node，不寫任何 `inet proxmox-firewall` 表 | 乾淨，nftables 空間讓給 pvefw-neo |
+| `host.enable=0` + `nftables=0` (iptables mode) | Perl daemon 仍然會安裝一堆 `PVEFW-*` iptables framework chains（`generate_std_chains` 無條件執行），干擾 | 拒絕啟動 |
+| `host.enable=1` 任意 mode | PVE 會在這台 node 安裝 host-level 規則 | 拒絕啟動 |
+
+**cluster.fw flag file 的順帶效應**：
+
+當 `cluster.fw enable=1` AND `host.fw nftables=1` 時，PVE 會
+`unlink /run/proxmox-nftables-firewall-force-disable`。這個 flag file
+影響 `needs_fwbr()` 的計算：
+
+```perl
+sub needs_fwbr { !is_nftables() || is_ovs_bridge() }
+sub is_nftables { !-e $FORCE_NFT_DISABLE_FLAG_FILE }
+```
+
+- Flag file 不存在 → `is_nftables=true` → Linux bridge 上的 `firewall=1`
+  **不會**觸發 fwbr 建立
+- Flag file 存在 → `is_nftables=false` → `firewall=1` 會建 fwbr
+
+因此「datacenter enable=1」實際上有一個意外的好處：它讓 Linux bridge 上
+的 PVE 原生 `firewall=1` 不再自動建 fwbr。對 pvefw-neo 沒有直接好處（我們
+只管 `firewall=0`），但對使用者在同一台 host 切換 PVE native ↔ pvefw-neo
+更平順。
+
+OVS bridge 無論 flag file 如何，`firewall=1` 都會建 fwbr（PVE 源碼硬編碼
+`is_ovs_bridge() → needs_fwbr=true`）。所以 OVS 上的 `firewall=1` port 永遠
+無法被 pvefw-neo 管理，使用者必須設 `firewall=0`。
+
+### 10.4.1 NIC firewall flag 硬性要求
+
+pvefw-neo 管理的 VM NIC 必須設 `firewall=0` 或不設：
+
+| | PVE 原生 | pvefw-neo |
+|---|---|---|
+| `firewall=1` | 建 fwbr + 套 PVE 規則 | **警告 + 跳過**（fwbr 擋著無法管理） |
+| `firewall=0` | 略過（直連 vmbr） | **管理** |
+| `firewall` 未設 | 略過（直連 vmbr） | **管理** |
+
+原因：
+- pvefw-neo 需要 tap/veth 直連 vmbr 才能下 bridge family 規則
+- `firewall=1` 會讓 PVE 自動插入 fwbr 中介橋，打破 direct-attach 模型
+- 在 `compile_ruleset` 時發現 `firewall=1` 的 NIC 會印警告並 skip
+
+**install.sh 的批次轉換工具**：掃描所有 `.conf`，詢問是否把 `firewall=1`
+一次改成 `firewall=0`，用 `qm set / pct set` 即時生效。
+
+### 10.4.2 Per-port 除錯開關：`@neo:disable`
+
+除錯時常常需要「暫時關掉某個 port 的防火牆看看是不是它的問題」。pvefw-neo
+提供 `@neo:disable` sugar tag 做這件事，不用動 VM config、不用刪規則：
+
+```ini
+[RULES]
+|OUT Finger(DROP) -enable 0 -i net0 # @neo:disable
+```
+
+加這一行之後：
+- compiler 將 `NetDev.disabled = True`
+- backend 看到 `disabled=True` 就**完全跳過**該 port
+  - nftables: netdev table 被清除、raw chain 不加規則、forward dispatch 不加 jump/goto
+  - OVS: tables 0/10/30/31 都不加該 port 的 flow
+- 封包走 forward chain 的 default `accept` → 透通
+
+注意是**單向**跳過：CT2003 標記 disable 後，CT2003 的 rules 失效，但別的 VM（CT2004）
+的 rules 還是會對進入 CT2004 的流量生效。所以 CT2003→CT2004 的連線可能仍被
+CT2004 的 `policy_in DROP` 擋掉。
+
+`--dump-ir` 會顯示 `[disabled]` 標記方便除錯：
+
+```
+# ── NetDev veth2003i0  vm2003/net0  mac=02:00:00:AA:03:00 [disabled] ──
+  (rules omitted: port is disabled via @neo:disable)
+```
+
+### 10.4.3 Orphan cleanup
+
+每次 `apply_ruleset` 時，main.py 會先掃描現有的 `pvefw-neo-*` netdev table
+並全部刪除，然後再載入新的 ruleset。這是為了處理：
+- `@neo:disable` 標記的 port（不再產生 table）
+- NIC 從 `firewall=0` 改成 `firewall=1`（不再管理）
+- VM 被刪除或 `.fw` 被移除
+- NetDev 消失（下線 / destroy）
+
+如果不做這個 cleanup，舊的 netdev table 會殘留在 kernel 裡持續過濾，變成
+silent stale state。
 
 ### 10.5 Atomic apply
 

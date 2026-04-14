@@ -280,7 +280,7 @@ class OvsRenderer:
         stateful_devs = set()
         for devname in self.my_devs:
             nd = self.rs.netdevs.get(devname)
-            if not nd:
+            if not nd or nd.disabled:
                 continue
             if any(r.phase == ir.Phase.STATEFUL for r in nd.rules):
                 stateful_devs.add(devname)
@@ -299,6 +299,10 @@ class OvsRenderer:
         for devname in sorted(self.my_devs):
             nd = self.rs.netdevs.get(devname)
             if nd is None:
+                continue
+            # @neo:disable: skip port entirely — no flows emitted, packet
+            # falls through to table default (NORMAL) = pass-through.
+            if nd.disabled:
                 continue
             ofport = self.port_map.get(devname)
             if ofport is None:
@@ -451,7 +455,7 @@ class OvsRenderer:
         iso_devs = []
         for devname in sorted(self.my_devs):
             nd = self.rs.netdevs.get(devname)
-            if nd and nd.isolated:
+            if nd and nd.isolated and not nd.disabled:
                 iso_devs.append(devname)
 
         if len(iso_devs) < 2:

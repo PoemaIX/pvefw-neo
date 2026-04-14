@@ -22,11 +22,19 @@ def parse_ct_config(vmid):
 
 
 def _parse_net_lines(path, model_pattern):
-    """Parse netX lines from a PVE config file."""
+    """Parse netX lines from a PVE config file.
+
+    Stops at the first [section] marker — PVE uses [special:...] and
+    [snapshot:...] sections for pending state and snapshots, whose net
+    entries must not overwrite the current config.
+    """
     nets = {}
     with open(path) as f:
         for line in f:
             line = line.strip()
+            # Section markers: [special:cloudinit], [PENDING], [snapshot:foo]
+            if line.startswith("["):
+                break
             if line.startswith("#") or ":" not in line:
                 continue
             key, _, value = line.partition(":")

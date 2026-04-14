@@ -104,6 +104,9 @@ class NetDev:
     isolated: bool = False     # Linux bridge isolated flag (語意 A)
                                #   nft: bridge link set isolated on
                                #   ovs: reg0 mark + dl_dst drop
+    disabled: bool = False     # @neo:disable — debug switch, 跳過整個 port
+                               # backends 看到 disabled=True 就完全 skip,
+                               # 封包透通（跟 port 沒出現在 IR 等價）
     rules: list = field(default_factory=list)  # list[Rule]，按 .fw 順序
 
 
@@ -145,11 +148,17 @@ class Ruleset:
             flags = []
             if nd.isolated:
                 flags.append("isolated")
+            if nd.disabled:
+                flags.append("disabled")
             flag_str = f" [{','.join(flags)}]" if flags else ""
             lines.append(
                 f"# ── NetDev {devname}  vm{nd.vmid}/{nd.iface}  "
                 f"mac={nd.mac}{flag_str} ──"
             )
+            if nd.disabled:
+                lines.append("  (rules omitted: port is disabled via @neo:disable)")
+                lines.append("")
+                continue
 
             by_phase = {Phase.STATELESS: [], Phase.STATEFUL: []}
             for r in nd.rules:

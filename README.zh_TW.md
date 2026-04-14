@@ -39,6 +39,66 @@ pvefw-neo 透過讀取相同的 `.fw` 設定檔、自己生成獨立的 nftables
 
 ---
 
+## 與 PVE 原生防火牆共存
+
+pvefw-neo 跟 PVE 原生防火牆**共存**，不是取代。可以讓 cluster 裡
+某些 node 用 pvefw-neo、其他 node 繼續用 PVE 原生，不必整個 cluster
+一起遷移。
+
+### 模型：node off + nftables mode
+
+每台跑 pvefw-neo 的 node，`host.fw` 必須是：
+
+```ini
+[OPTIONS]
+enable: 0        # node 層防火牆關 → PVE Rust daemon 跳過這台 node
+nftables: 1      # nftables mode → Perl daemon defer，不裝 iptables
+```
+
+這兩個設定下：
+
+- **`pve-firewall`（Perl daemon）** — 在 `update()` 看到 nftables mode
+  會直接 `return`，不裝任何 iptables chain
+- **`proxmox-firewall`（Rust daemon）** — 看到 `host.enable=0` 會跳過
+  這台 node，不寫任何 `inet proxmox-firewall` 表
+
+pvefw-neo 於是獨佔這台 node 的 nftables 空間管理 VM 防火牆。**不需要**
+停掉 PVE 的任一個 daemon，datacenter 層的 firewall 也可以繼續開著
+給其他 node 用。
+
+### NIC firewall flag 的硬性要求
+
+pvefw-neo 管理的 VM **NIC 必須設 `firewall=0` 或不設**。原因：PVE 在
+`firewall=1` 時會自動在 tap/veth 跟 vmbr 中間插一層 `fwbr`（firewall
+bridge），打破 pvefw-neo 的 direct-attach 模型。
+
+| port flag | PVE 行為 | pvefw-neo 行為 |
+|-----------|---------|---------------|
+| `firewall=1` | 建 fwbr | **警告 + 略過**（fwbr 擋著無法管理） |
+| `firewall=0` | tap/veth 直連 vmbr | **管理** |
+| 未設 | tap/veth 直連 vmbr | **管理** |
+
+WebUI 建立 NIC 時的 "Firewall" 勾選框**不要打勾**就是 pvefw-neo 要的狀態。
+`install.sh` 提供一次性批次轉換，把現有 `firewall=1` 的 NIC 全部改成
+`firewall=0`。
+
+### Per-port 除錯：`@neo:disable`
+
+如果想暫時關掉某個 port 的防火牆（例如除錯連線問題），在該 VM 的 `.fw`
+裡加一條 `@neo:disable` 語法糖規則：
+
+```ini
+|OUT Finger(DROP) -enable 0 -i net0 # @neo:disable
+```
+
+被標記的 port 完全不會有 netdev table、raw 規則、forward dispatch，封包
+走 forward chain 的 default `accept` policy，對 pvefw-neo 而言就是
+「allow all」。VM 的其他 port 跟另一端（peer）的規則仍然正常運作。
+
+移除 `@neo:disable` 那行就恢復管理。
+
+---
+
 ## 安裝
 
 ```bash
@@ -47,13 +107,15 @@ cd /tmp/pvefw-neo
 bash install.sh
 ```
 
-`install.sh` 會：
+`install.sh` 會**互動式**執行：
 
-1. `apt install python3-nftables python3-inotify`
-2. `git clone https://github.com/PoemaIX/pvefw-neo.git /usr/local/lib/pvefw_neo`
-3. Symlink launcher → `/usr/local/bin/pvefw-neo`
-4. Symlink systemd unit → `/etc/systemd/system/pvefw-neo.service`
-5. 跑一次驗證
+1. 說明共存模型跟 port-level 反轉
+2. `apt install python3-nftables python3-inotify`
+3. Clone（或 dev mode symlink）到 `/usr/local/lib/pvefw_neo`
+4. Symlink launcher + systemd unit
+5. **詢問**：更新 `/etc/pve/nodes/<this>/host.fw` 成 `enable=0, nftables=1`？
+6. **詢問**：把所有 VM/CT NIC 的 `firewall=1` 一次改成 `firewall=0`？
+7. 執行 `pvefw-neo --preflight-check` 驗證
 
 ### 開發模式（symlink 而非 clone）
 
@@ -62,16 +124,6 @@ DEV_LINK=/path/to/your/pvefw-neo bash install.sh
 ```
 
 把 `/usr/local/lib/pvefw_neo` 軟連結到你的 working dir，編輯立即生效。
-
-### 停掉衝突的服務
-
-`pvefw-neo` 要求 PVE 內建防火牆**已關閉**：
-
-```bash
-systemctl disable --now pve-firewall.service proxmox-firewall.service
-```
-
-如果這兩個還在跑，daemon 會拒絕啟動。
 
 ### 啟用 daemon
 
@@ -124,7 +176,7 @@ pvefw-neo --dry-run           # 輸出 nftables 規則文字
 pvefw-neo --dump-ir           # 輸出 IR 中間表示 (除錯用)
 pvefw-neo --dump-ovs vmbr2    # 輸出某個 OVS bridge 的 flows
 pvefw-neo --flush             # 清除所有 pvefw-neo 狀態 (nft + OVS)
-pvefw-neo --preflight-check   # 檢查 PVE firewall 是否已停
+pvefw-neo --preflight-check   # 驗證 host.fw enable=0 + nftables=1
 pvefw-neo --daemon            # 啟動 daemon (給 systemd 用)
 ```
 
@@ -208,6 +260,7 @@ trusted_net 10.0.0.0/24
 | `@neo:nondp` | 阻止 IPv6 Neighbor Solicit/Advert（防偽 NDP）。 |
 | `@neo:mcast_limit <pps>` | netdev ingress 對 multicast 封包做 rate limit。 |
 | `@neo:isolated` | 設定 kernel bridge `isolated on`（Linux）或對應的 OF 規則（OVS）。兩個 isolated port 互相不通；isolated ↔ 非 isolated 仍可通。 |
+| `@neo:disable` | **除錯用**。完全略過 pvefw-neo 對這個 port 的管理：沒有 netdev table、沒有 raw 規則、沒有 forward dispatch，封包走 `accept`。詳見上方「Per-port 除錯」。|
 
 #### 底層原語（primitive）— 附加在真正規則上做精細控制
 

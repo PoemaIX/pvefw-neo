@@ -44,6 +44,68 @@ It does **not** modify any PVE source code — it only reads
 
 ---
 
+## Coexistence with PVE native firewall
+
+pvefw-neo runs **alongside** PVE's native firewall, not as a replacement.
+You can have some cluster nodes using pvefw-neo and others using PVE
+native firewall — no need to migrate the whole cluster.
+
+### The model: node off + nftables mode
+
+On each node running pvefw-neo, `host.fw` must have:
+
+```ini
+[OPTIONS]
+enable: 0        # node-level firewall off → PVE Rust daemon skips this node
+nftables: 1      # nftables mode → Perl daemon defers, no iptables rules
+```
+
+With these two settings:
+
+- **`pve-firewall` (Perl daemon)** — detects nftables mode, `return`s from
+  its `update()` path without installing any iptables chains on this host.
+- **`proxmox-firewall` (Rust daemon)** — detects `host.enable=0`, installs
+  nothing in the `inet proxmox-firewall` nftables table for this node.
+
+pvefw-neo then gets exclusive nftables space for VM firewall rules on
+this host. You do **not** need to stop either PVE daemon, and the
+datacenter-level firewall can stay enabled for other nodes.
+
+### Port-level flag requirements
+
+Every NIC in a pvefw-neo-managed VM **must have `firewall=0` or be
+unset**. The flag controls whether PVE auto-builds a `fwbr` (firewall
+bridge) between the tap/veth and the real vmbr; with a fwbr in the
+middle, pvefw-neo's direct-attach model breaks.
+
+| Port flag | PVE behavior | pvefw-neo behavior |
+|-----------|--------------|--------------------|
+| `firewall=1` | builds a fwbr | **warns and skips** (can't manage through fwbr) |
+| `firewall=0` | direct-attach to vmbr | **manages** |
+| unset | direct-attach to vmbr | **manages** |
+
+So the WebUI "Firewall" checkbox should be **unchecked** on every NIC
+you want pvefw-neo to manage. `install.sh` offers a one-shot bulk-flip
+to convert existing `firewall=1` NICs to `firewall=0`.
+
+### Per-port debug: `@neo:disable`
+
+To temporarily bypass all pvefw-neo rules on one port without touching
+VM config, add a `@neo:disable` sugar rule to that VM's `.fw`:
+
+```ini
+|OUT Finger(DROP) -enable 0 -i net0 # @neo:disable
+```
+
+The affected port gets no netdev table, no raw rules, no forward
+dispatch — packets fall through the default `accept` policy, i.e.
+pvefw-neo-wise the port is "allow all". The rest of the VM (and the
+peer side of any VM-to-VM traffic) still enforces its own rules.
+
+Remove the `@neo:disable` line to re-enable.
+
+---
+
 ## Install
 
 ```bash
@@ -52,13 +114,15 @@ cd /tmp/pvefw-neo
 bash install.sh
 ```
 
-`install.sh` will:
+`install.sh` will **interactively**:
 
-1. `apt install python3-nftables python3-inotify`
-2. `git clone https://github.com/PoemaIX/pvefw-neo.git /usr/local/lib/pvefw_neo`
-3. Symlink launcher → `/usr/local/bin/pvefw-neo`
-4. Symlink systemd unit → `/etc/systemd/system/pvefw-neo.service`
-5. Run a quick verification
+1. Explain the model and port-level inversion
+2. `apt install python3-nftables python3-inotify`
+3. Clone (or symlink in dev mode) to `/usr/local/lib/pvefw_neo`
+4. Symlink the launcher and systemd unit
+5. **Ask**: update `/etc/pve/nodes/<this>/host.fw` to `enable=0, nftables=1`?
+6. **Ask**: bulk-invert `firewall=1` → `firewall=0` on existing VM/CT NICs?
+7. Run `pvefw-neo --preflight-check` to verify
 
 ### Development install (symlink instead of clone)
 
@@ -67,17 +131,7 @@ DEV_LINK=/path/to/your/pvefw-neo bash install.sh
 ```
 
 This symlinks `/usr/local/lib/pvefw_neo` to your working dir so edits
-take effect immediately. Used for development.
-
-### Stop conflicting services
-
-`pvefw-neo` requires the built-in PVE firewall to be **disabled**:
-
-```bash
-systemctl disable --now pve-firewall.service proxmox-firewall.service
-```
-
-The daemon refuses to start if either is still running.
+take effect immediately.
 
 ### Enable the daemon
 
@@ -131,7 +185,7 @@ pvefw-neo --dry-run           # Print generated nftables ruleset
 pvefw-neo --dump-ir           # Print intermediate representation (debug)
 pvefw-neo --dump-ovs vmbr2    # Print OVS flows for a specific bridge
 pvefw-neo --flush             # Remove all pvefw-neo state (nft + OVS)
-pvefw-neo --preflight-check   # Check that PVE firewall is stopped
+pvefw-neo --preflight-check   # Verify host.fw enable=0 + nftables=1
 pvefw-neo --daemon            # Run daemon (used by systemd)
 ```
 
@@ -220,6 +274,7 @@ rule (`-enable 0` so PVE itself ignores it) as a carrier:
 | `@neo:nondp` | Drop IPv6 Neighbor Solicit/Advert (block fake NDP). |
 | `@neo:mcast_limit <pps>` | Rate-limit multicast frames at netdev ingress. |
 | `@neo:isolated` | Set kernel bridge `isolated on` (Linux) or equivalent OF rule (OVS). Two isolated ports cannot communicate; isolated ↔ non-isolated still works. |
+| `@neo:disable` | **Debug only.** Bypass all pvefw-neo rules on this port — no netdev table, no raw rules, no forward dispatch. Packets fall through `accept`. See "Per-port debug" above. |
 
 #### Primitive tags — append to a real rule for fine control
 

@@ -71,8 +71,33 @@ class Compiler:
             if not nets:
                 continue
 
-            # Pre-create NetDev for each net interface
+            # Pre-create NetDev for each interface.
+            #
+            # Hard requirement: NIC must NOT have `firewall=1` in VM config.
+            #
+            # Rationale: PVE automatically creates a fwbr (firewall bridge)
+            # between tap/veth and vmbr whenever NIC has `firewall=1` (on
+            # OVS always, and on Linux bridge when `is_nftables()=false`).
+            # The fwbr breaks pvefw-neo's direct-attach model. Users must
+            # set `firewall=0` (or leave unset) on every NIC; install.sh
+            # offers to bulk-flip existing firewall=1 NICs.
+            #
+            # Ports with firewall=1 are warned and skipped. Everything
+            # else (firewall=0 or unset) becomes a candidate NetDev.
+            #
+            # For per-port debug, use `@neo:disable` in the .fw file to
+            # temporarily bypass a port's rules without touching the
+            # VM config (see _sugar_disable).
             for iface_name, net_info in nets.items():
+                if net_info.get("firewall") == 1:
+                    print(
+                        f"WARNING: vm{vmid} {iface_name} has 'firewall=1' "
+                        f"— PVE will build a fwbr and pvefw-neo cannot "
+                        f"manage this port. Set firewall=0 (or unset) to "
+                        f"fix, or run install.sh to bulk-flip.",
+                        flush=True,
+                    )
+                    continue
                 devname = vmdevs.get_device_name(vmid, net_info["id"], is_ct)
                 self.netdevs[devname] = ir.NetDev(
                     devname=devname,
@@ -81,7 +106,9 @@ class Compiler:
                     iface=iface_name,
                 )
 
-            # Process rules
+            # Process rules. @neo:disable sugar handler may mark NetDevs as
+            # disabled; NetDev lookup silently skips missing NetDevs so
+            # warn-skipped firewall=1 ports are inert.
             self._compile_vm(vmid, config, nets, is_ct)
 
             # Translate policy_in / policy_out to explicit catch-all rules
@@ -194,6 +221,7 @@ class Compiler:
                 "nondp":       self._sugar_nondp,
                 "mcast_limit": self._sugar_mcast_limit,
                 "isolated":    self._sugar_isolated,
+                "disable":     self._sugar_disable,
             }.get(tag.name)
             if handler:
                 handler(vmid, config, nets, is_ct, rule, tag)
@@ -364,6 +392,21 @@ class Compiler:
             nd = self.netdevs.get(devname)
             if nd:
                 nd.isolated = True
+
+    def _sugar_disable(self, vmid, config, nets, is_ct, rule, tag):
+        """@neo:disable → set NetDev.disabled (debug: bypass this port).
+
+        Equivalent to removing all rules for this port so packets pass
+        through without any filtering or conntrack. Useful for quickly
+        turning off a port's firewall to diagnose connectivity issues
+        without touching VM config or deleting rules.
+
+        Without `-i netN` the disable applies to all ports of the VM.
+        """
+        for iface, devname in self._get_iface_devnames(vmid, rule, nets, is_ct):
+            nd = self.netdevs.get(devname)
+            if nd:
+                nd.disabled = True
 
     # ═══════════════════════════════════════
     # @neo:notrack rule expansion

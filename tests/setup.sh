@@ -46,10 +46,12 @@ for CTID in 2003 2004; do
         IP_LAST=$((CTID - 2003 + 13))  # 2003→13, 2004→14
         MAC_LAST=$(printf '%02X' $((CTID - 2003 + 3)))
         echo "[+] Creating CT $CTID (10.99.0.$IP_LAST, MAC 02:00:00:AA:${MAC_LAST}:00)"
+        # NOTE: firewall=0 selects pvefw-neo (opposite of PVE native),
+        # see compiler.py port filter comment.
         pct create $CTID "$TEMPLATE" \
             --hostname "test-fw-ct$((CTID-2002))" \
             --memory 256 --swap 0 --cores 1 \
-            --net0 "name=eth0,bridge=vmbr1,hwaddr=02:00:00:AA:${MAC_LAST}:00,ip=10.99.0.${IP_LAST}/24,gw=10.99.0.1" \
+            --net0 "name=eth0,bridge=vmbr1,hwaddr=02:00:00:AA:${MAC_LAST}:00,ip=10.99.0.${IP_LAST}/24,gw=10.99.0.1,firewall=0" \
             --rootfs local-lvm:1 \
             --password changeme \
             --unprivileged 1
@@ -191,13 +193,23 @@ peer 10.99.0.13
 |OUT ACCEPT -i net0
 FWEOF
 
-# ── 7. Stop conflicting services ──
-for svc in pve-firewall proxmox-firewall; do
-    if systemctl is-active $svc.service &>/dev/null; then
-        echo "[+] Stopping $svc"
-        systemctl stop $svc.service
-    fi
-done
+# ── 7. Set up host.fw for pvefw-neo preflight ──
+# pvefw-neo requires: host.fw [OPTIONS] enable=0, nftables=1
+NODENAME=$(hostname)
+HOST_FW="/etc/pve/nodes/$NODENAME/host.fw"
+mkdir -p "$(dirname "$HOST_FW")"
+if [ ! -f "$HOST_FW" ] || ! grep -q "^nftables: 1" "$HOST_FW" || ! grep -q "^enable: 0" "$HOST_FW"; then
+    echo "[+] Writing $HOST_FW with enable=0, nftables=1"
+    cat > "$HOST_FW" <<HOSTFW
+[OPTIONS]
+
+nftables: 1
+enable: 0
+
+[RULES]
+
+HOSTFW
+fi
 
 # ── 8. Apply pvefw-neo ──
 echo "[+] Applying pvefw-neo ruleset..."

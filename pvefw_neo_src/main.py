@@ -22,32 +22,102 @@ FW_DIR = "/etc/pve/firewall"
 
 
 def preflight_check():
-    """Check preconditions before starting."""
+    """Check preconditions before starting.
+
+    pvefw-neo runs alongside PVE's native firewall using the "node off +
+    nftables mode" model:
+
+      - /etc/pve/nodes/<this>/host.fw has [OPTIONS] enable: 0
+      - /etc/pve/nodes/<this>/host.fw has [OPTIONS] nftables: 1
+
+    This tells PVE's own firewall daemons to leave THIS node alone:
+      - pve-firewall Perl daemon: sees nftables mode → defers, removes its
+        legacy iptables chains (verified on-host)
+      - proxmox-firewall Rust daemon: sees host.enable=0 → skips this node,
+        installs nothing in the inet proxmox-firewall table for this host
+
+    The rest of the cluster can still run PVE native firewall normally.
+
+    datacenter level (cluster.fw enable) is NOT checked — the user is free
+    to enable datacenter firewall for other nodes.
+    """
     errors = []
+    import socket
+    nodename = socket.gethostname()
+    host_fw_path = f"/etc/pve/nodes/{nodename}/host.fw"
 
-    # Check conflicting services
-    for svc in ("pve-firewall.service", "proxmox-firewall.service"):
-        ret = subprocess.run(
-            ["systemctl", "is-active", svc],
-            capture_output=True, text=True,
-        )
-        if ret.stdout.strip() == "active":
-            errors.append(f"{svc} is still running. Stop it first.")
+    host_enable, host_nftables = _read_host_fw_options(host_fw_path)
 
-    # Check cluster.fw enable flag
-    from . import parser
-    cluster = parser.parse_cluster_fw()
-    if cluster.options.enable:
+    if host_enable is None:
         errors.append(
-            "cluster.fw has 'enable: 1'. pvefw-neo requires PVE firewall "
-            "to be disabled at datacenter level."
+            f"{host_fw_path} not found or missing [OPTIONS]. Run install.sh "
+            f"to set it up, or add '[OPTIONS]\\nenable: 0\\nnftables: 1'."
         )
+    else:
+        if host_enable != 0:
+            errors.append(
+                f"{host_fw_path} must have 'enable: 0' (got {host_enable}). "
+                f"pvefw-neo manages this node's firewall — the PVE native "
+                f"node-level firewall must be off here."
+            )
+        if host_nftables != 1:
+            errors.append(
+                f"{host_fw_path} must have 'nftables: 1' (got {host_nftables}). "
+                f"iptables mode installs legacy PVEFW chains that would "
+                f"interfere with pvefw-neo's nftables rules."
+            )
 
     if errors:
         for e in errors:
             print(f"ERROR: {e}", file=sys.stderr)
+        print(
+            "\nHint: bash /usr/local/lib/pvefw_neo/install.sh will fix these "
+            "interactively.",
+            file=sys.stderr,
+        )
         return False
     return True
+
+
+def _read_host_fw_options(path):
+    """Parse [OPTIONS] from a host.fw file.
+
+    Returns (enable, nftables) as ints, or (None, None) if file missing.
+    """
+    if not os.path.isfile(path):
+        return None, None
+    enable = None
+    nftables = None
+    in_options = False
+    try:
+        with open(path) as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("["):
+                    in_options = line.lower().startswith("[options]")
+                    continue
+                if not in_options:
+                    continue
+                if ":" in line:
+                    k, _, v = line.partition(":")
+                    k = k.strip().lower()
+                    v = v.strip()
+                    if k == "enable":
+                        try:
+                            enable = int(v)
+                        except ValueError:
+                            pass
+                    elif k == "nftables":
+                        try:
+                            nftables = int(v)
+                        except ValueError:
+                            pass
+    except OSError:
+        return None, None
+    # Missing values default to 0 (PVE default for both)
+    return enable or 0, nftables or 0
 
 
 def compile_ir():
@@ -132,6 +202,25 @@ def generate_and_check():
 def apply_ruleset(ir_rs, nft_text, isolated_devs, ovs_groups):
     """Apply nftables ruleset, OVS flows, and bridge isolation."""
     os.makedirs("/run/pvefw-neo", exist_ok=True)
+
+    # ── Clean up orphaned netdev tables (disabled or removed ports) ──
+    # The ruleset only flushes tables it's about to recreate. Tables for
+    # ports that used to be managed but aren't now (e.g. @neo:disable,
+    # firewall=1 added, VM deleted) would otherwise linger.
+    ret = subprocess.run(
+        ["nft", "list", "tables"],
+        capture_output=True, text=True,
+    )
+    if ret.returncode == 0:
+        for line in ret.stdout.splitlines():
+            parts = line.strip().split()
+            # "table netdev pvefw-neo-<devname>"
+            if len(parts) == 3 and parts[0] == "table" and parts[1] == "netdev" \
+                    and parts[2].startswith("pvefw-neo-"):
+                subprocess.run(
+                    ["nft", "delete", "table", "netdev", parts[2]],
+                    capture_output=True, text=True,
+                )
 
     # ── Apply nftables (linux bridge ports) ──
     with open(RULESET_PATH, "w") as f:
