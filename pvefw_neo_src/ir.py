@@ -49,7 +49,8 @@ class Direction(Enum):
 #
 # ── L2 keys ──
 #   src_mac:        str           "AA:BB:CC:DD:EE:FF"
-#   src_mac_neg:    str           源 MAC != (用於 macspoof)
+#   src_mac_neg:    str | list    源 MAC != (用於 macspoof，支援多 MAC)
+#   src_mac_mask:   (addr, mask)  bitmask 比對 (用於 @neo:srcmac bitmask)
 #   dst_mac:        str
 #   dst_mac_mask:   (addr, mask)  bitmask 比對 (multicast: 01:00:00:00:00:00)
 #   ether_type:     str           "ip" / "ip6" / "arp" / "vlan"
@@ -65,7 +66,8 @@ class Direction(Enum):
 #   src_set:        str           NamedSet 名稱
 #   dst_set:        str
 #   proto:          str           "tcp" / "udp" / "icmp" / "icmpv6" / "47"
-#   icmpv6_type:    list[str]     ["nd-router-advert"]
+#   icmp_type:      list[str]     ["echo-request", "echo-reply"]   (v4)
+#   icmpv6_type:    list[str]     ["nd-router-advert"]              (v6)
 #
 # ── L4 keys ──
 #   src_port:       str           "80" / "1024-65535" / "{80,443}"
@@ -87,6 +89,8 @@ class Rule:
     action: str                # "accept" / "drop"
                                # 未來: "dnat:1.2.3.4:80" / "snat:..." / "masquerade"
     rate_limit_pps: int = None # 選用，搭配 action="drop"
+    log_level: str = None      # 選用，PVE -log emerg/alert/crit/err/warning/notice/info/debug
+                               # nftgen 為非空 log_level 額外發 nflog rule（mirror official）
     comment: str = ""          # .fw 註解 + @neo: tag 原文
 
 
@@ -116,10 +120,22 @@ class NetDev:
 
 @dataclass
 class NamedSet:
-    """命名 IP 集合，對應 .fw 的 [IPSET name]。"""
+    """命名 IP 集合，對應 .fw 的 [IPSET name]。
+
+    PVE ipset 成員允許前綴 `!` 表示「排除」(nomatch)。nftables set 本身
+    不支援 per-element 否定，所以我們把它拆成兩個邏輯集合：
+
+      elements: 正向成員  → backend 渲染成 set <name>
+      excludes: 否定成員  → backend 渲染成 set <name>_nomatch（若非空）
+
+    參考 official Rust impl: proxmox-firewall/src/object.rs 把每個 IPSet
+    生成 `<name>` 和 `<name>-nomatch` 兩個 nft set，rule 引用時同時 match
+    `field == @<name>` AND `field != @<name>_nomatch`。我們採用同樣作法。
+    """
     name: str                  # 全域唯一，例 "vm100_whitelist"
     family: str                # "ipv4" / "ipv6"
-    elements: list             # ["10.0.0.0/24", "10.0.1.5"]
+    elements: list             # 正向 ["10.0.0.0/24", "10.0.1.5"]
+    excludes: list = field(default_factory=list)  # 否定 ["10.0.0.5"]
 
 
 # ═══════════════════════════════════════

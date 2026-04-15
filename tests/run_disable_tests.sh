@@ -18,7 +18,7 @@ set -u
 PASS=0; FAIL=0
 CT_DISABLED=2003
 CT_NORMAL=2004
-DISABLE_LINE='|OUT Finger(DROP) -enable 0 -i net0 # @neo:disable'
+DISABLE_LINE='|OUT Finger(DROP) -i net0 # @neo:disable'
 
 check() {
     local name="$1" expect="$2" actual="$3"

@@ -163,11 +163,16 @@ pvefw-neo 把它映射到對應的 `tap`/`veth` device name。
 
 ### 5.1 兩層設計
 
-**語法糖**：一條規則搞定常見場景，不用管順序。用 Finger dummy（`enable=0`）。
+**語法糖**：一條規則搞定常見場景，不用管順序。用 Finger dummy 規則作為載體，
+**加上開頭的 `|`** — PVE 把開頭 `|` 的 rule 視為 disabled（見 `PVE/Firewall.pm:3171`）
+直接忽略，但 pvefw-neo 透過 comment 裡的 `@neo:` tag 認得它並展開成真正的規則。
 
-**底層原語**：附加在正常規則上，使用者自己控制順序和組合。
+**底層原語**：附加在正常規則上（這些是「正常啟用」的規則，**不加** `|`），
+使用者自己控制順序和組合。
 
-### 5.2 語法糖（Finger dummy, enable=0）
+> ⚠️ PVE `.fw` 語法：`|` = disabled，沒 `|` = enabled。WebUI 的 enable 開關就是加/去 `|`。
+
+### 5.2 語法糖（Finger dummy，leading `|` = disabled）
 
 語法糖自動展開成多條 nftables 規則，使用者不需要理解展開細節。
 必須搭配 `-i netX` 指定 port。
@@ -178,7 +183,7 @@ pvefw-neo 把它映射到對應的 `tap`/`veth` device name。
 同時防護 ARP spoofing 和 NDP spoofing（自動展開）。
 
 ```
-|OUT Finger(DROP) -enable 0 -i net0 # @neo:ipspoof 10.0.0.100/32,fd00::100/128
+|OUT Finger(DROP) -i net0 # @neo:ipspoof 10.0.0.100/32,fd00::100/128
 ```
 
 展開為（bridge raw_prerouting, NOTRACK）：
@@ -216,13 +221,13 @@ iifname "tap100i0" ether type ip6 drop
 防止 MAC spoofing。只允許指定的 source MAC，其他 drop。
 
 ```
-|OUT Finger(DROP) -enable 0 -i net0 # @neo:macspoof 02:00:00:00:01:00
+|OUT Finger(DROP) -i net0 # @neo:macspoof 02:00:00:00:01:00
 ```
 
 不帶參數時自動從 VM config 讀取 MAC：
 
 ```
-|OUT Finger(DROP) -enable 0 -i net0 # @neo:macspoof
+|OUT Finger(DROP) -i net0 # @neo:macspoof
 ```
 
 展開為（netdev ingress）：
@@ -237,7 +242,7 @@ ether saddr != 02:00:00:00:01:00 drop
 禁止 VM 充當 DHCP server。
 
 ```
-|OUT Finger(DROP) -enable 0 -i net0 # @neo:nodhcp
+|OUT Finger(DROP) -i net0 # @neo:nodhcp
 ```
 
 展開為（bridge raw_prerouting, NOTRACK）：
@@ -252,7 +257,7 @@ iifname "tap100i0" ether type ip6 udp sport 547 udp dport 546 drop
 禁止 VM 發送 Router Advertisement。
 
 ```
-|OUT Finger(DROP) -enable 0 -i net0 # @neo:nora
+|OUT Finger(DROP) -i net0 # @neo:nora
 ```
 
 展開為：
@@ -266,7 +271,7 @@ iifname "tap100i0" ether type ip6 icmpv6 type nd-router-advert drop
 禁止 VM 發送 NDP（Neighbor Solicitation / Advertisement）。
 
 ```
-|OUT Finger(DROP) -enable 0 -i net0 # @neo:nondp
+|OUT Finger(DROP) -i net0 # @neo:nondp
 ```
 
 展開為：
@@ -280,7 +285,7 @@ iifname "tap100i0" ether type ip6 icmpv6 type { nd-neighbor-solicit, nd-neighbor
 限制 multicast 封包速率。
 
 ```
-|OUT Finger(DROP) -enable 0 -i net0 # @neo:mcast_limit 100
+|OUT Finger(DROP) -i net0 # @neo:mcast_limit 100
 ```
 
 展開為（netdev ingress，最早攔截）：
@@ -295,7 +300,7 @@ ether daddr & 01:00:00:00:00:00 == 01:00:00:00:00:00 limit rate over 100/second 
 啟用 port isolation。該 port 無法與同 bridge 上的其他 VM port 通訊。
 
 ```
-|OUT Finger(DROP) -enable 0 -i net2 # @neo:isolated
+|OUT Finger(DROP) -i net2 # @neo:isolated
 ```
 
 展開為：
@@ -336,24 +341,39 @@ iifname "tap100i0" drop
 **順序重要**：多條 `@neo:notrack` 規則按 `.fw` 檔案中的出現順序排列。
 使用者有責任確保先 ACCEPT 再 DROP。
 
-#### `@neo:mac <src_mac> [dst_mac]`
+#### `@neo:srcmac` / `@neo:dstmac` `<exact|bitmask> <mac>`
 
-為規則附加 MAC 地址 match 條件。必須搭配 `@neo:notrack` 使用。
+為規則附加 MAC 地址 match 條件，限縮規則的套用範圍。可搭配
+`@neo:notrack` 或一般 stateful 規則使用。
 
 ```
-|OUT ACCEPT -i net0 # @neo:notrack @neo:mac 02:00:00:00:01:00
-|OUT DROP   -i net0 # @neo:notrack @neo:mac *
+# srcmac exact：source MAC 等於 02:00:00:00:01:00
+|IN ACCEPT -i net0 -p tcp -dport 22 # @neo:srcmac exact 02:00:00:00:01:00
+
+# dstmac bitmask：destination MAC & 01:00:... == 01:00:...（multicast bit）
+|OUT DROP -i net0 # @neo:notrack @neo:dstmac bitmask 01:00:00:00:00:00
 ```
 
-- 只寫一個參數 → match src MAC
-- `*` = any（不加 MAC 條件）
-- 兩個參數 → `@neo:mac <src> <dst>`
+- `exact <mac>` → `ether saddr/daddr == mac`
+- `bitmask <mac>` → `ether saddr/daddr & mac == mac`
+- 不寫模式時預設 `exact`
+
+#### `@neo:rateexceed <pps>`
+
+只匹配該規則條件中**超過** `<pps>` 的封包；rate 內的封包落到下一條規
+則。**僅支援 `@neo:notrack`**：stateful 規則上的 `@neo:rateexceed` 會
+被忽略並送出 WARNING。
+
+```
+# 單 VM multicast ratelimit，drop 超出 100 pps 的部分
+|OUT DROP -i net0 # @neo:notrack @neo:rateexceed 100 @neo:dstmac bitmask 01:00:00:00:00:00
+```
 
 翻譯為：
 
 ```nft
-iifname "tap100i0" ether saddr 02:00:00:00:01:00 accept
-iifname "tap100i0" drop
+iifname "tap100i0" ether daddr & 01:00:00:00:00:00 == 01:00:00:00:00:00 \
+    limit rate over 100/second drop
 ```
 
 #### `@neo:vlan <vid|untagged>`
@@ -397,17 +417,19 @@ ether type != 8021q
 
 | Tag | 類型 | Finger dummy? | Chain | 用途 |
 |-----|------|--------------|-------|------|
-| `@neo:ipspoof <ip,...>` | 語法糖 | ✅ enable=0 | bridge raw | IP + ARP + NDP spoofing prevention |
-| `@neo:macspoof [mac]` | 語法糖 | ✅ enable=0 | netdev ingress | MAC spoofing prevention |
-| `@neo:nodhcp` | 語法糖 | ✅ enable=0 | bridge raw | 禁止當 DHCP server |
-| `@neo:nora` | 語法糖 | ✅ enable=0 | bridge raw | 禁止發 RA |
-| `@neo:nondp` | 語法糖 | ✅ enable=0 | bridge raw | 禁止發 NDP |
-| `@neo:mcast_limit <pps>` | 功能 | ✅ enable=0 | netdev ingress | multicast ratelimit |
-| `@neo:isolated` | 功能 | ✅ enable=0 | bridge fwd + kernel | port isolation |
-| `@neo:disable` | 功能 | ✅ enable=0 | 跳過整個 port | debug：該 port 完全不處理 |
+| `@neo:ipspoof <ip,...>` | 語法糖 | ✅ leading `|` | bridge raw | IP + ARP + NDP spoofing prevention |
+| `@neo:macspoof [mac]` | 語法糖 | ✅ leading `|` | netdev ingress | MAC spoofing prevention |
+| `@neo:nodhcp` | 語法糖 | ✅ leading `|` | bridge raw | 禁止當 DHCP server |
+| `@neo:nora` | 語法糖 | ✅ leading `|` | bridge raw | 禁止發 RA |
+| `@neo:nondp` | 語法糖 | ✅ leading `|` | bridge raw | 禁止發 NDP |
+| `@neo:mcast_limit <pps>` | 功能 | ✅ leading `|` | netdev ingress | multicast ratelimit |
+| `@neo:isolated` | 功能 | ✅ leading `|` | bridge fwd + kernel | port isolation |
+| `@neo:disable` | 功能 | ✅ leading `|` | 跳過整個 port | debug：該 port 完全不處理 |
 | `@neo:notrack` | 原語 | ❌ 正常規則 | bridge raw | 規則走 raw chain |
-| `@neo:mac <src> [dst]` | 原語 | ❌ 正常規則 | 隨所附加規則 | 加 MAC match 條件 |
-| `@neo:vlan <vid\|untagged>` | 原語 | ❌ 正常規則 | 隨所附加規則 | 加 VLAN match 條件 |
+| `@neo:srcmac <exact\|bitmask> <mac>` | decorator | ❌ 正常規則 | 隨所附加規則 | 加 source MAC match 條件 |
+| `@neo:dstmac <exact\|bitmask> <mac>` | decorator | ❌ 正常規則 | 隨所附加規則 | 加 dest MAC match 條件 |
+| `@neo:vlan <vid\|untagged>` | decorator | ❌ 正常規則 | 隨所附加規則 | 加 VLAN match 條件 |
+| `@neo:rateexceed <pps>` | decorator | ❌ 正常規則 | bridge raw | 只匹配超出 pps 的封包（僅限 notrack）|
 
 ---
 
@@ -420,8 +442,8 @@ ether type != 8021q
 例如 `.fw` 中的規則順序：
 
 ```
-|OUT Finger(DROP) -enable 0 -i net0 # @neo:macspoof 02:00:00:00:01:00
-|OUT Finger(DROP) -enable 0 -i net0 # @neo:ipspoof 10.0.0.100/32
+|OUT Finger(DROP) -i net0 # @neo:macspoof 02:00:00:00:01:00
+|OUT Finger(DROP) -i net0 # @neo:ipspoof 10.0.0.100/32
 |OUT ACCEPT -i net0 -source 10.0.0.0/24 # @neo:notrack
 |OUT DROP   -i net0                     # @neo:notrack
 |IN  SSH(ACCEPT) -source 10.0.0.0/24 -i net0
@@ -593,18 +615,18 @@ mgmt_gw 10.0.0.1
 
 [RULES]
 # ── 語法糖 ──
-|OUT Finger(DROP) -enable 0 -i net0 # @neo:macspoof
-|OUT Finger(DROP) -enable 0 -i net0 # @neo:ipspoof 10.0.0.100/32
-|OUT Finger(DROP) -enable 0 -i net0 # @neo:nodhcp
-|OUT Finger(DROP) -enable 0 -i net0 # @neo:nora
+|OUT Finger(DROP) -i net0 # @neo:macspoof
+|OUT Finger(DROP) -i net0 # @neo:ipspoof 10.0.0.100/32
+|OUT Finger(DROP) -i net0 # @neo:nodhcp
+|OUT Finger(DROP) -i net0 # @neo:nora
 
-|OUT Finger(DROP) -enable 0 -i net1 # @neo:macspoof 02:00:00:00:02:00
-|OUT Finger(DROP) -enable 0 -i net1 # @neo:nodhcp
-|OUT Finger(DROP) -enable 0 -i net1 # @neo:nora
+|OUT Finger(DROP) -i net1 # @neo:macspoof 02:00:00:00:02:00
+|OUT Finger(DROP) -i net1 # @neo:nodhcp
+|OUT Finger(DROP) -i net1 # @neo:nora
 
-|OUT Finger(DROP) -enable 0 -i net2 # @neo:macspoof
-|OUT Finger(DROP) -enable 0 -i net2 # @neo:isolated
-|OUT Finger(DROP) -enable 0 -i net2 # @neo:mcast_limit 100
+|OUT Finger(DROP) -i net2 # @neo:macspoof
+|OUT Finger(DROP) -i net2 # @neo:isolated
+|OUT Finger(DROP) -i net2 # @neo:mcast_limit 100
 
 # ── 底層原語：net1 BGP notrack ACL ──
 |OUT ACCEPT -i net1 -source 169.254.0.0/16 # @neo:notrack
@@ -788,7 +810,7 @@ myserver = 10.0.1.100
 [RULES]
 |IN SSH(ACCEPT) -source 10.0.0.0/24
 |OUT ACCEPT
-|OUT Finger(DROP) -enable 0 -i net0 # @neo:ipspoof 10.0.0.100/32
+|OUT Finger(DROP) -i net0 # @neo:ipspoof 10.0.0.100/32
 ```
 
 ### 9.2 解析流程
@@ -802,7 +824,8 @@ myserver = 10.0.1.100
    c. 分類：
       - Finger dummy + `@neo:` sugar tag → 展開成 NOTRACK 規則
       - 正常規則 + `@neo:notrack` → 放入 raw chain
-      - 正常規則 + `@neo:mac` → 加上 MAC match
+      - 正常規則 + `@neo:srcmac`/`@neo:dstmac`/`@neo:vlan` → 加上對應 L2 match
+      - 正常規則 + `@neo:rateexceed` (僅限 notrack) → 設定 rate limit
       - 正常規則（無 tag） → 放入 forward chain（stateful）
 5. 解析 `cluster.fw` → security groups, cluster-wide aliases/ipsets
 
@@ -1017,7 +1040,7 @@ pvefw-neo 管理的 VM NIC 必須設 `firewall=0` 或不設：
 
 ```ini
 [RULES]
-|OUT Finger(DROP) -enable 0 -i net0 # @neo:disable
+|OUT Finger(DROP) -i net0 # @neo:disable
 ```
 
 加這一行之後：

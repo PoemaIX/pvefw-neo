@@ -8,6 +8,7 @@ produces a backend-agnostic IR Ruleset organized per NetDev.
 import copy
 import ipaddress
 import re
+import sys
 
 from . import ir
 from . import parser
@@ -43,6 +44,27 @@ def normalize_port(port_str):
         ports = [p.replace(":", "-") for p in port_str.split(",")]
         return "{" + ",".join(ports) + "}"
     return port_str.replace(":", "-")
+
+
+# PVE/Firewall.pm valid log levels (excluding "nolog" which means "no log rule").
+# Mirrors official `LogLevel::try_from` in proxmox-firewall.
+_PVE_LOG_LEVELS = {"emerg", "alert", "crit", "err", "warning", "notice",
+                    "info", "debug"}
+
+
+def _normalize_log_level(value):
+    """Return a valid log level string or None.
+
+    PVE accepts "nolog" (= disabled) and the 8 syslog levels above.
+    Anything else is silently treated as no logging (matches official
+    behavior — invalid level → LogLevel::try_from fails → no log rule).
+    """
+    if not value:
+        return None
+    v = value.strip().lower()
+    if v in _PVE_LOG_LEVELS:
+        return v
+    return None
 
 
 # ═══════════════════════════════════════
@@ -95,6 +117,7 @@ class Compiler:
                         f"— PVE will build a fwbr and pvefw-neo cannot "
                         f"manage this port. Set firewall=0 (or unset) to "
                         f"fix, or run install.sh to bulk-flip.",
+                        file=sys.stderr,
                         flush=True,
                     )
                     continue
@@ -123,9 +146,16 @@ class Compiler:
     def _compile_vm(self, vmid, config, nets, is_ct):
         for rule in config.rules:
             if rule.is_group:
+                if not rule.enable:
+                    continue
                 self._expand_group(vmid, config, nets, is_ct, rule)
             elif rule.is_sugar():
+                # Sugar carriers are *intentionally* disabled in PVE (no leading `|`)
+                # so PVE itself ignores them; we expand them here.
                 self._expand_sugar(vmid, config, nets, is_ct, rule)
+            elif not rule.enable:
+                # Disabled rule with no @neo: meaning — honor PVE's intent and skip.
+                continue
             elif rule.is_notrack():
                 self._expand_notrack(vmid, config, nets, is_ct, rule)
             else:
@@ -227,17 +257,24 @@ class Compiler:
                 handler(vmid, config, nets, is_ct, rule, tag)
 
     def _sugar_macspoof(self, vmid, config, nets, is_ct, rule, tag):
-        """@neo:macspoof → STATELESS rule with src_mac_neg (purely L2)."""
+        """@neo:macspoof [mac1,mac2,...] → STATELESS rule: drop if src MAC
+        not in the whitelist. Empty args = auto-read from VM config."""
         for iface, devname in self._get_iface_devnames(vmid, rule, nets, is_ct):
-            mac = tag.args[0].upper() if tag.args else nets.get(iface, {}).get("mac")
-            if not mac:
+            if tag.args:
+                macs = [m.strip().upper() for m in tag.args[0].split(",")
+                        if m.strip()]
+            else:
+                auto = nets.get(iface, {}).get("mac")
+                macs = [auto.upper()] if auto else []
+            if not macs:
                 continue
+            neg = macs[0] if len(macs) == 1 else macs
             self._add_rule(devname, ir.Rule(
                 direction=ir.Direction.OUT,
                 phase=ir.Phase.STATELESS,
-                match={"l2": {"src_mac_neg": mac.upper()}},
+                match={"l2": {"src_mac_neg": neg}},
                 action="drop",
-                comment=f"@neo:macspoof {mac.upper()}",
+                comment=f"@neo:macspoof {','.join(macs)}",
             ))
 
     def _sugar_ipspoof(self, vmid, config, nets, is_ct, rule, tag):
@@ -413,37 +450,70 @@ class Compiler:
     # ═══════════════════════════════════════
 
     def _expand_notrack(self, vmid, config, nets, is_ct, rule):
-        mac_tag = rule.get_neo_tag("mac")
-        vlan_tag = rule.get_neo_tag("vlan")
-
         for iface, devname in self._get_iface_devnames(vmid, rule, nets, is_ct):
-            ir_rules = self._build_notrack_rules(
-                vmid, config, devname, rule, mac_tag, vlan_tag
-            )
+            ir_rules = self._build_notrack_rules(vmid, config, devname, rule)
             for r in ir_rules:
                 self._add_rule(devname, r)
 
-    def _build_notrack_rules(self, vmid, config, devname, rule, mac_tag, vlan_tag):
-        """Build IR rules for a @neo:notrack rule."""
-        base_match = {"l2": {}, "l3": {}, "l4": {}}
+    def _apply_l2_primitives(self, match, rule):
+        """Apply @neo:srcmac / @neo:dstmac / @neo:vlan decorators onto an L2
+        match dict.
 
-        # MAC tag
-        if mac_tag and mac_tag.args:
-            src_mac = mac_tag.args[0]
-            if src_mac != "*":
-                base_match["l2"]["src_mac"] = src_mac
-            if len(mac_tag.args) > 1:
-                dst_mac = mac_tag.args[1]
-                if dst_mac != "*":
-                    base_match["l2"]["dst_mac"] = dst_mac
+        Shared by notrack and stateful paths so a rule like
+        `|IN ACCEPT -p tcp -dport 22 # @neo:srcmac exact 02:00:00:AA:03:00`
+        works uniformly — decorator conditions are AND'd with the rule's
+        natural L3/L4 match.
 
-        # VLAN tag
+        Syntax:
+          @neo:srcmac exact <mac>        ether saddr == mac
+          @neo:srcmac bitmask <mac>      ether saddr & mac == mac
+          @neo:dstmac exact <mac>        ether daddr == mac
+          @neo:dstmac bitmask <mac>      ether daddr & mac == mac
+        A bare `@neo:srcmac <mac>` (no mode) defaults to `exact`.
+        """
+        for tag_name, exact_key, mask_key in (
+            ("srcmac", "src_mac", "src_mac_mask"),
+            ("dstmac", "dst_mac", "dst_mac_mask"),
+        ):
+            tag = rule.get_neo_tag(tag_name)
+            if not tag or not tag.args:
+                continue
+            if len(tag.args) >= 2 and tag.args[0].lower() in ("exact", "bitmask"):
+                mode = tag.args[0].lower()
+                mac = tag.args[1]
+            else:
+                mode = "exact"
+                mac = tag.args[0]
+            mac = mac.upper()
+            if mode == "bitmask":
+                match["l2"][mask_key] = (mac, mac)
+            else:
+                match["l2"][exact_key] = mac
+
+        vlan_tag = rule.get_neo_tag("vlan")
         if vlan_tag and vlan_tag.args:
             vlan_str = vlan_tag.args[0]
             if vlan_str == "untagged":
-                base_match["l2"]["ether_type_neg"] = "vlan"
+                match["l2"]["ether_type_neg"] = "vlan"
             else:
-                base_match["l2"]["vlan_id"] = [int(v) for v in vlan_str.split(",")]
+                match["l2"]["vlan_id"] = [int(v) for v in vlan_str.split(",")]
+
+    @staticmethod
+    def _rate_pps_from_rule(rule):
+        """Return int pps from @neo:rateexceed tag, or None."""
+        tag = rule.get_neo_tag("rateexceed")
+        if tag and tag.args:
+            try:
+                return int(tag.args[0])
+            except ValueError:
+                return None
+        return None
+
+    def _build_notrack_rules(self, vmid, config, devname, rule):
+        """Build IR rules for a @neo:notrack rule."""
+        base_match = {"l2": {}, "l3": {}, "l4": {}}
+
+        self._apply_l2_primitives(base_match, rule)
 
         # Source/dest (sets ether_type)
         self._apply_src_dst(base_match, rule, config)
@@ -455,22 +525,29 @@ class Compiler:
             base_match["l4"]["src_port"] = normalize_port(rule.sport)
         if rule.dport:
             base_match["l4"]["dst_port"] = normalize_port(rule.dport)
+        if rule.icmp_type:
+            self._apply_icmp_type(base_match, rule.icmp_type)
 
         action = "drop" if rule.action in ("DROP", "REJECT") else "accept"
         direction = self._pve_dir(rule.direction)
+        log_level = _normalize_log_level(rule.log)
+        rate_pps = self._rate_pps_from_rule(rule)
 
         # Macro expansion
         if rule.macro and rule.macro != "Finger":
-            return self._expand_macro_rules(base_match, rule, action,
-                                           direction, ir.Phase.STATELESS)
+            results = self._expand_macro_rules(base_match, rule, action,
+                                               direction, ir.Phase.STATELESS,
+                                               log_level=log_level)
+        else:
+            results = self._materialize_family_variants(
+                base_match, direction, ir.Phase.STATELESS, action,
+                log_level, rule.comment or "",
+            )
 
-        return [ir.Rule(
-            direction=direction,
-            phase=ir.Phase.STATELESS,
-            match=_clean_match(base_match),
-            action=action,
-            comment=rule.comment or "",
-        )]
+        if rate_pps is not None:
+            for r in results:
+                r.rate_limit_pps = rate_pps
+        return results
 
     # ═══════════════════════════════════════
     # Stateful rule expansion
@@ -485,18 +562,30 @@ class Compiler:
     def _build_stateful_rules(self, vmid, config, rule):
         action = "drop" if rule.action in ("DROP", "REJECT") else "accept"
         direction = self._pve_dir(rule.direction)
+        log_level = _normalize_log_level(rule.log)
+
+        if rule.get_neo_tag("rateexceed"):
+            print(
+                f"WARNING: vm{vmid} line {rule.line_num}: @neo:rateexceed "
+                f"is only supported on @neo:notrack rules; decorator ignored.",
+                file=sys.stderr,
+                flush=True,
+            )
 
         if rule.macro:
             macro_entries = self.macros.get(rule.macro, [])
             if not macro_entries:
                 return []
             base_match = {"l2": {}, "l3": {}, "l4": {}}
+            self._apply_l2_primitives(base_match, rule)
             self._apply_src_dst(base_match, rule, config)
             return self._expand_macro_rules(base_match, rule, action,
-                                           direction, ir.Phase.STATEFUL)
+                                           direction, ir.Phase.STATEFUL,
+                                           log_level=log_level)
 
         # No macro: build single rule
         match = {"l2": {}, "l3": {}, "l4": {}}
+        self._apply_l2_primitives(match, rule)
         self._apply_src_dst(match, rule, config)
         if rule.proto:
             match["l3"]["proto"] = rule.proto.lower()
@@ -504,17 +593,21 @@ class Compiler:
             match["l4"]["src_port"] = normalize_port(rule.sport)
         if rule.dport:
             match["l4"]["dst_port"] = normalize_port(rule.dport)
+        if rule.icmp_type:
+            self._apply_icmp_type(match, rule.icmp_type)
 
-        return [ir.Rule(
-            direction=direction,
-            phase=ir.Phase.STATEFUL,
-            match=_clean_match(match),
-            action=action,
-            comment=rule.comment or "",
-        )]
+        return self._materialize_family_variants(match, direction,
+                                                 ir.Phase.STATEFUL, action,
+                                                 log_level, rule.comment or "")
 
-    def _expand_macro_rules(self, base_match, rule, action, direction, phase):
-        """Expand a PVE macro into multiple IR rules, merging with base match."""
+    def _expand_macro_rules(self, base_match, rule, action, direction, phase,
+                             log_level=None):
+        """Expand a PVE macro into multiple IR rules, merging with base match.
+
+        For each macro entry we run the same per-family materialization as
+        plain rules, so a macro applied to a mixed-family ipset is correctly
+        cloned per family.
+        """
         macro_entries = self.macros.get(rule.macro, [])
         results = []
         for entry in macro_entries:
@@ -526,12 +619,10 @@ class Compiler:
                 m["l4"]["dst_port"] = normalize_port(entry["dport"])
             if entry.get("sport"):
                 m["l4"]["src_port"] = normalize_port(entry["sport"])
-            results.append(ir.Rule(
-                direction=direction,
-                phase=phase,
-                match=_clean_match(m),
-                action=action,
-                comment=rule.comment or "",
+            if rule.icmp_type:
+                self._apply_icmp_type(m, rule.icmp_type)
+            results.extend(self._materialize_family_variants(
+                m, direction, phase, action, log_level, rule.comment or "",
             ))
         return results
 
@@ -548,7 +639,10 @@ class Compiler:
                 grule.iface = rule.iface
             if grule.is_sugar():
                 self._expand_sugar(vmid, config, nets, is_ct, grule)
-            elif grule.is_notrack():
+                continue
+            if not grule.enable:
+                continue
+            if grule.is_notrack():
                 self._expand_notrack(vmid, config, nets, is_ct, grule)
             else:
                 self._expand_stateful(vmid, config, nets, is_ct, grule)
@@ -558,46 +652,62 @@ class Compiler:
     # ═══════════════════════════════════════
 
     def _apply_src_dst(self, match, rule, config):
-        """Resolve source/dest into match dict, set ether_type."""
+        """Resolve source/dest into match dict.
+
+        For literal IPs / aliases (always single-family) writes ether_type
+        immediately. For ipset refs that contain both v4 and v6 members,
+        leaves a `__src_set_pf__` / `__dst_set_pf__` magic key holding a
+        {family: set_name} dict; `_materialize_family_variants` splits the
+        rule into per-family copies later (mirrors official Rust impl
+        which clones rules per family in handle_set/handle_match).
+        """
         src = self._resolve_value(rule.source, config)
         dst = self._resolve_value(rule.dest, config)
 
         ether_type = None
 
-        if src:
-            if src.startswith("@"):
-                set_name = src[1:]
+        for value, set_key, ip_key, alt_key in (
+            (src, "src_set", "src_ip", "__src_set_pf__"),
+            (dst, "dst_set", "dst_ip", "__dst_set_pf__"),
+        ):
+            if not value:
+                continue
+            if isinstance(value, dict):
+                # Per-family ipset (mixed v4/v6) — defer to family split.
+                match["l3"][alt_key] = value
+                continue
+            if value.startswith("@"):
+                set_name = value[1:]
                 fam = self._set_families.get(set_name, "ipv4")
-                match["l3"]["src_set"] = set_name
-                ether_type = "ip" if fam == "ipv4" else "ip6"
-            elif is_ipv4(src.split("/")[0]):
-                match["l3"]["src_ip"] = src
-                ether_type = "ip"
-            elif is_ipv6(src.split("/")[0]):
-                match["l3"]["src_ip"] = src
-                ether_type = "ip6"
+                match["l3"][set_key] = set_name
+                et = "ip" if fam == "ipv4" else "ip6"
+            elif is_ipv4(value.split("/")[0]):
+                match["l3"][ip_key] = value
+                et = "ip"
+            elif is_ipv6(value.split("/")[0]):
+                match["l3"][ip_key] = value
+                et = "ip6"
+            else:
+                continue
+            if ether_type is None:
+                ether_type = et
+            elif ether_type != et:
+                # Mixed src(v4) + dst(v6) — official drops such rules.
+                # We mark the match as poisoned via a sentinel.
+                match["__poison__"] = True
 
-        if dst:
-            if dst.startswith("@"):
-                set_name = dst[1:]
-                fam = self._set_families.get(set_name, "ipv4")
-                match["l3"]["dst_set"] = set_name
-                if not ether_type:
-                    ether_type = "ip" if fam == "ipv4" else "ip6"
-            elif is_ipv4(dst.split("/")[0]):
-                match["l3"]["dst_ip"] = dst
-                if not ether_type:
-                    ether_type = "ip"
-            elif is_ipv6(dst.split("/")[0]):
-                match["l3"]["dst_ip"] = dst
-                if not ether_type:
-                    ether_type = "ip6"
-
-        if ether_type:
+        if ether_type and "ether_type" not in match["l2"]:
             match["l2"]["ether_type"] = ether_type
 
     def _resolve_value(self, value, config):
-        """Resolve alias/ipset reference to IP or @setname."""
+        """Resolve alias/ipset reference.
+
+        Returns:
+          None              — unresolvable
+          str (IP/CIDR)     — literal address
+          str ("@<name>")   — single-family ipset (already materialized)
+          dict {fam: name}  — multi-family ipset (per-family materialized)
+        """
         if not value:
             return None
 
@@ -607,31 +717,177 @@ class Compiler:
 
         if typ in ("ip", "alias"):
             return resolved
-        elif typ == "ipset":
-            set_name = f"vm{config.vmid}_{resolved}"
-            if resolved in config.ipsets:
-                members = config.ipsets[resolved]
-                resolved_members = []
-                for member in members:
-                    if member.startswith("guest/") or member.startswith("+"):
-                        ref = member.lstrip("+").replace("guest/", "").replace("dc/", "")
-                        if ref in config.aliases:
-                            resolved_members.append(config.aliases[ref])
-                        elif ref in config.ipsets:
-                            resolved_members.extend(config.ipsets[ref])
-                    else:
-                        resolved_members.append(member)
-                if resolved_members:
-                    has_v4 = any(is_ipv4(m.split("/")[0]) for m in resolved_members)
-                    fam = "ipv4" if has_v4 else "ipv6"
-                    self.sets[set_name] = ir.NamedSet(
-                        name=set_name, family=fam, elements=resolved_members,
-                    )
-                    self._set_families[set_name] = fam
-                    return f"@{set_name}"
-            return None
+
+        if typ == "ipset":
+            if resolved not in config.ipsets:
+                return None
+            per_fam = self._materialize_ipset_by_family(
+                config.ipsets[resolved], config
+            )
+            # Drop empty families
+            per_fam = {f: pn for f, pn in per_fam.items() if pn[0] or pn[1]}
+            if not per_fam:
+                return None
+
+            base = f"vm{config.vmid}_{resolved}"
+            family_set_names = {}
+            for fam, (positives, excludes) in per_fam.items():
+                # v4 keeps the bare name (back-compat with existing tests);
+                # v6 gets a `_v6` suffix. Mirrors official `v4-`/`v6-` split
+                # in spirit but stays within our existing naming scheme.
+                sname = base if fam == "ipv4" else f"{base}_v6"
+                self.sets[sname] = ir.NamedSet(
+                    name=sname,
+                    family=fam,
+                    elements=positives,
+                    excludes=excludes,
+                )
+                self._set_families[sname] = fam
+                family_set_names[fam] = f"@{sname}"
+
+            if len(family_set_names) == 1:
+                return next(iter(family_set_names.values()))
+            return family_set_names  # mixed-family
 
         return value
+
+    def _materialize_ipset(self, members, config, _seen=None):
+        """Family-blind variant — kept for callers that don't care.
+
+        Returns (positives, excludes) flattened across both families.
+        """
+        per_fam = self._materialize_ipset_by_family(members, config, _seen)
+        positives, excludes = [], []
+        for pos, neg in per_fam.values():
+            positives.extend(pos)
+            excludes.extend(neg)
+        return positives, excludes
+
+    def _materialize_ipset_by_family(self, members, config, _seen=None):
+        """Resolve PVE ipset members and partition by IP family.
+
+        Member syntax (mirror of `proxmox-ve-config` ipset parser):
+          IP / CIDR                       literal positive
+          !IP / !CIDR                     literal negative
+          dc/<alias> / guest/<alias>      scoped alias  → resolve
+          !dc/<alias> / !guest/<alias>    scoped alias, negated
+          +dc/<set> / +guest/<set>        nested ipset (rare; flatten)
+          !+dc/<set>                      negated nested set (polarity flip)
+
+        Returns dict {family: (positives, excludes)} for any non-empty
+        family. Unresolved refs are silently dropped (PVE does the same).
+        """
+        _seen = _seen or set()
+        buckets = {"ipv4": ([], []), "ipv6": ([], [])}
+
+        def _bucket_for(addr):
+            ip = addr.split("/")[0]
+            if is_ipv4(ip):
+                return buckets["ipv4"]
+            if is_ipv6(ip):
+                return buckets["ipv6"]
+            return None
+
+        for raw in members:
+            negated = raw.startswith("!")
+            bare = raw.lstrip("!").strip()
+
+            # ── Nested ipset reference ──
+            if bare.startswith("+"):
+                ref = bare.lstrip("+").split("/", 1)[-1]
+                if ref in _seen or ref not in config.ipsets:
+                    continue
+                sub = self._materialize_ipset_by_family(
+                    config.ipsets[ref], config, _seen | {ref}
+                )
+                for fam, (sub_pos, sub_neg) in sub.items():
+                    pos, neg = buckets[fam]
+                    if negated:
+                        neg.extend(sub_pos)
+                        pos.extend(sub_neg)
+                    else:
+                        pos.extend(sub_pos)
+                        neg.extend(sub_neg)
+                continue
+
+            # ── Scoped alias ──
+            if bare.startswith(("dc/", "guest/")):
+                ref = bare.split("/", 1)[1]
+                addr = config.aliases.get(ref)
+                if not addr:
+                    continue  # silently drop
+                bucket = _bucket_for(addr)
+                if bucket is None:
+                    continue
+                (bucket[1] if negated else bucket[0]).append(addr)
+                continue
+
+            # ── Literal IP / CIDR ──
+            bucket = _bucket_for(bare)
+            if bucket is None:
+                continue
+            (bucket[1] if negated else bucket[0]).append(bare)
+
+        return buckets
+
+    def _materialize_family_variants(self, match, direction, phase, action,
+                                      log_level, comment):
+        """Turn a match dict (possibly carrying multi-family ipset refs) into
+        one or more IR rules. Mirrors official Rust per-family rule cloning."""
+        if match.pop("__poison__", False):
+            # Source / dest in incompatible families — official drops these.
+            return []
+
+        src_pf = match["l3"].pop("__src_set_pf__", None)
+        dst_pf = match["l3"].pop("__dst_set_pf__", None)
+
+        if not src_pf and not dst_pf:
+            cleaned = _clean_match(match)
+            return [ir.Rule(
+                direction=direction, phase=phase, match=cleaned,
+                action=action, log_level=log_level, comment=comment,
+            )]
+
+        # Determine which families to emit. If both sides are per-family,
+        # emit only families they share. Otherwise emit each family present
+        # on the side that has it, picking the literal/single-family side for
+        # the other.
+        src_fams = set(src_pf.keys()) if src_pf else None
+        dst_fams = set(dst_pf.keys()) if dst_pf else None
+        if src_fams and dst_fams:
+            fams = src_fams & dst_fams
+        else:
+            fams = src_fams or dst_fams
+
+        rules = []
+        for fam in sorted(fams):
+            m = copy.deepcopy(match)
+            m["l2"]["ether_type"] = "ip" if fam == "ipv4" else "ip6"
+            if src_pf:
+                m["l3"]["src_set"] = src_pf[fam].lstrip("@")
+            if dst_pf:
+                m["l3"]["dst_set"] = dst_pf[fam].lstrip("@")
+            rules.append(ir.Rule(
+                direction=direction, phase=phase, match=_clean_match(m),
+                action=action, log_level=log_level, comment=comment,
+            ))
+        return rules
+
+    def _apply_icmp_type(self, match, type_str):
+        """Wire `-icmp-type X` / `-icmpv6-type X` into the IR match.
+
+        Accepts comma-separated list. Family is inferred from current
+        ether_type if already set, else from proto. Default v4.
+        """
+        types = [t.strip() for t in type_str.split(",") if t.strip()]
+        if not types:
+            return
+        et = match["l2"].get("ether_type")
+        proto = match["l3"].get("proto", "").lower()
+        if et == "ip6" or proto == "icmpv6":
+            match["l3"]["icmpv6_type"] = types
+        else:
+            match["l3"]["icmp_type"] = types
 
 
 # ═══════════════════════════════════════

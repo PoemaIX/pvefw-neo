@@ -86,13 +86,13 @@ echo "[+] Writing cluster.fw"
 cat > /etc/pve/firewall/cluster.fw << 'FWEOF'
 [group security_group_1]
 
-|IN SSH(ACCEPT) -log nolog
-|IN Ping(ACCEPT) -log nolog
+IN SSH(ACCEPT) -log nolog
+IN Ping(ACCEPT) -log nolog
 
 [group sg_web]
 
-|IN HTTP(ACCEPT) -log nolog
-|IN HTTPS(ACCEPT) -log nolog
+IN HTTP(ACCEPT) -log nolog
+IN HTTPS(ACCEPT) -log nolog
 
 [ALIASES]
 
@@ -123,42 +123,42 @@ peer 10.99.0.14
 
 [RULES]
 
-# ═══ Sugar tags ═══
-|OUT Finger(DROP) -enable 0 -i net0 # @neo:macspoof
-|OUT Finger(DROP) -enable 0 -i net0 # @neo:ipspoof 10.99.0.13/32
-|OUT Finger(DROP) -enable 0 -i net0 # @neo:nodhcp
-|OUT Finger(DROP) -enable 0 -i net0 # @neo:nora
+# ═══ Sugar tags (carriers use leading | = disabled in PVE) ═══
+|OUT Finger(DROP) -i net0 # @neo:macspoof
+|OUT Finger(DROP) -i net0 # @neo:ipspoof 10.99.0.13/32
+|OUT Finger(DROP) -i net0 # @neo:nodhcp
+|OUT Finger(DROP) -i net0 # @neo:nora
 
-# ═══ Notrack + mac primitive ═══
-|OUT ACCEPT -i net0 -source 10.99.0.13/32 # @neo:notrack @neo:mac 02:00:00:AA:03:00
-|OUT DROP   -i net0                       # @neo:notrack
+# ═══ Notrack + srcmac decorator ═══
+OUT ACCEPT -i net0 -source 10.99.0.13/32 # @neo:notrack @neo:srcmac exact 02:00:00:AA:03:00
+OUT DROP   -i net0                       # @neo:notrack
 
 # ═══ Security Group reference ═══
-|GROUP security_group_1 -i net0
+GROUP security_group_1 -i net0
 
 # ═══ Alias as source (port 8080) ═══
-|IN ACCEPT -source trusted_net -p tcp -dport 8080 -i net0
+IN ACCEPT -source trusted_net -p tcp -dport 8080 -i net0
 
 # ═══ Alias as dest (block peer:4444 outbound) ═══
-|OUT DROP -dest peer -p tcp -dport 4444 -i net0
+OUT DROP -dest peer -p tcp -dport 4444 -i net0
 
 # ═══ IPSet as source (port 9090) ═══
-|IN ACCEPT -source +guest/allowed_sources -p tcp -dport 9090 -i net0
+IN ACCEPT -source +guest/allowed_sources -p tcp -dport 9090 -i net0
 
 # ═══ Multi-entry macro: DNS (udp/53 + tcp/53) ═══
-|IN DNS(ACCEPT) -source trusted_net -i net0
+IN DNS(ACCEPT) -source trusted_net -i net0
 
 # ═══ Multi-entry macro: BitTorrent (DROP) ═══
-|IN BitTorrent(DROP) -i net0
+IN BitTorrent(DROP) -i net0
 
 # ═══ Bare proto + port range ═══
-|IN ACCEPT -p udp -dport 5000:5100 -source 10.99.0.0/24 -i net0
+IN ACCEPT -p udp -dport 5000:5100 -source 10.99.0.0/24 -i net0
 
 # ═══ sport rule ═══
-|IN ACCEPT -p tcp -sport 1024:65535 -dport 3000 -i net0
+IN ACCEPT -p tcp -sport 1024:65535 -dport 3000 -i net0
 
 # ═══ Catch-all OUT ═══
-|OUT ACCEPT -i net0
+OUT ACCEPT -i net0
 FWEOF
 
 echo "[+] Writing 2004.fw"
@@ -176,21 +176,21 @@ peer 10.99.0.13
 
 [RULES]
 
-# ═══ Sugar tags ═══
-|OUT Finger(DROP) -enable 0 -i net0 # @neo:macspoof
-|OUT Finger(DROP) -enable 0 -i net0 # @neo:ipspoof 10.99.0.14/32
-|OUT Finger(DROP) -enable 0 -i net0 # @neo:nodhcp
-|OUT Finger(DROP) -enable 0 -i net0 # @neo:nora
+# ═══ Sugar tags (carriers use leading | = disabled in PVE) ═══
+|OUT Finger(DROP) -i net0 # @neo:macspoof
+|OUT Finger(DROP) -i net0 # @neo:ipspoof 10.99.0.14/32
+|OUT Finger(DROP) -i net0 # @neo:nodhcp
+|OUT Finger(DROP) -i net0 # @neo:nora
 
 # ═══ Security Group: sg_web ═══
-|GROUP sg_web -i net0
+GROUP sg_web -i net0
 
 # ═══ Alias in stateful rule ═══
-|IN SSH(ACCEPT) -source peer -i net0
-|IN Ping(ACCEPT) -source trusted_net -i net0
+IN SSH(ACCEPT) -source peer -i net0
+IN Ping(ACCEPT) -source trusted_net -i net0
 
 # ═══ Catch-all OUT ═══
-|OUT ACCEPT -i net0
+OUT ACCEPT -i net0
 FWEOF
 
 # ── 7. Set up host.fw for pvefw-neo preflight ──

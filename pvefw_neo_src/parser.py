@@ -30,6 +30,7 @@ class FwRule:
         self.proto = None
         self.sport = None
         self.dport = None
+        self.icmp_type = None   # PVE -icmp-type / -icmpv6-type
         self.log = None
         self.comment = None
         self.neo_tags = []      # list of NeoTag
@@ -38,10 +39,15 @@ class FwRule:
         self.line_num = 0
 
     def is_sugar(self):
-        """Check if this is a sugar tag rule (Finger dummy with enable=0)."""
+        """Check if this is a sugar tag rule (Finger dummy, no leading `|` in PVE)."""
         if not self.neo_tags:
             return False
         return not self.enable and self.macro == "Finger"
+
+    @property
+    def enabled_in_pve(self):
+        """Mirror of self.enable, kept for clarity at call sites."""
+        return self.enable
 
     def is_notrack(self):
         """Check if this rule has @neo:notrack tag."""
@@ -110,15 +116,29 @@ def parse_neo_tags(comment):
 def parse_rule_line(line):
     """Parse a single PVE firewall rule line.
 
-    Format: |DIRECTION ACTION [-options...] [# comment]
-    or:     |DIRECTION MACRO(ACTION) [-options...] [# comment]
-    or:     |GROUP group_name [-options...]
+    Format:  DIRECTION ACTION [-options...] [# comment]   (enabled)
+    or:     |DIRECTION ACTION [-options...] [# comment]   (disabled — PVE WebUI)
+    or:      DIRECTION MACRO(ACTION) [-options...] [# comment]
+    or:      GROUP group_name [-options...]
+
+    PVE marks a rule as disabled by a **leading `|`** (see PVE Firewall.pm
+    line 3171: `$rule->{enable} = $line =~ s/^\\|// ? 0 : 1`). We still parse
+    disabled rules (we use them as sugar carriers for @neo: tags) but set
+    rule.enable = False so downstream knows PVE itself ignores them.
     """
     line = line.strip()
-    if not line.startswith("|"):
+    if not line:
+        return None
+
+    enabled = not line.startswith("|")
+
+    # First token must look like a direction/GROUP or this isn't a rule line.
+    probe = line.lstrip("|").split(None, 1)[0].upper() if line.lstrip("|") else ""
+    if probe not in ("IN", "OUT", "FORWARD", "GROUP"):
         return None
 
     rule = FwRule()
+    rule.enable = enabled
 
     # Split comment
     comment_part = None
@@ -201,6 +221,9 @@ def _parse_options(rule, parts):
             i += 2
         elif p in ("-enable",) and i + 1 < len(parts):
             rule.enable = parts[i + 1] != "0"
+            i += 2
+        elif p in ("-icmp-type", "-icmpv6-type") and i + 1 < len(parts):
+            rule.icmp_type = parts[i + 1]
             i += 2
         elif p in ("-log",) and i + 1 < len(parts):
             rule.log = parts[i + 1]
@@ -389,35 +412,48 @@ def resolve_alias(name, aliases):
 def resolve_source_dest(value, aliases, ipsets, vmid=None):
     """Resolve a -source or -dest value.
 
+    PVE namespace conventions (mirrors official Rust impl
+    `proxmox-firewall/src/config.rs::alias`/`ipset`):
+
+      +<scope>/<name>   ipset ref  (scope: guest, dc, sdn)
+      +<name>           legacy ipset ref (vm-local, then cluster)
+      <scope>/<name>    alias ref  (scope: guest, dc)
+      <name>            legacy alias ref (vm-local, then cluster)
+      <ip>[/<cidr>]     literal address
+
     Returns (type, resolved_value) where type is:
-      "ip" - direct IP/CIDR
-      "ipset" - nftables set reference
-      "alias" - resolved to IP
-      None - could not resolve
+      "ip"    - literal IP/CIDR
+      "ipset" - set name (caller materializes)
+      "alias" - alias resolved to IP/CIDR
+      None    - could not resolve
     """
     if not value:
         return None, None
 
-    # guest/aliasname -> alias reference with guest prefix
-    if value.startswith("guest/"):
-        ref = value[6:]
-        # Check if it's an ipset reference: +guest/setname
-        return "alias", resolve_alias(ref, aliases)
-
-    # +guest/ipsetname or dc/ipsetname
-    m = re.match(r'^\+?(?:guest|dc)/(\w+)$', value)
-    if m:
-        set_name = m.group(1)
-        if set_name in ipsets:
-            return "ipset", set_name
+    # ── ipset reference: must start with `+` ──
+    if value.startswith("+"):
+        m = re.match(r'^\+(?:(?:guest|dc|sdn)/)?(\w+)$', value)
+        if m:
+            set_name = m.group(1)
+            if set_name in ipsets:
+                return "ipset", set_name
         return None, None
 
-    # Direct alias
+    # ── scoped alias: dc/<name> or guest/<name> ──
+    m = re.match(r'^(?:guest|dc)/(\w+)$', value)
+    if m:
+        ref = m.group(1)
+        resolved = resolve_alias(ref, aliases)
+        if resolved:
+            return "alias", resolved
+        return None, None
+
+    # ── legacy bare alias (identifier-shaped, not an IP) ──
     if re.match(r'^[a-zA-Z]', value) and "/" not in value and "." not in value and ":" not in value:
         resolved = resolve_alias(value, aliases)
         if resolved:
             return "alias", resolved
         return None, None
 
-    # Direct IP/CIDR
+    # ── literal IP/CIDR ──
     return "ip", value

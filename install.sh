@@ -40,7 +40,7 @@ pvefw-neo coexists with PVE's native firewall using the
     temporarily bypass all pvefw-neo rules on one port, without
     touching VM config. Example:
 
-        |OUT Finger(DROP) -enable 0 -i net0 # @neo:disable
+        |OUT Finger(DROP) -i net0 # @neo:disable
 
 EOF
 
@@ -324,7 +324,7 @@ if [ "$n_unfiltered" -gt 0 ]; then
     echo "add a @neo:disable sugar tag for each of these NICs in the"
     echo "corresponding <vmid>.fw file:"
     echo ""
-    echo "    |OUT Finger(DROP) -enable 0 -i <netN> # @neo:disable"
+    echo "    |OUT Finger(DROP) -i <netN> # @neo:disable"
     echo ""
     echo "You can remove these lines later to let pvefw-neo manage them."
     echo ""
@@ -337,7 +337,7 @@ if [ "$n_unfiltered" -gt 0 ]; then
         awk -F'|' '$4==0 || ($4==1 && $5==0) {print $1, $2, $3}' "$tmpfile" \
         | while read type vmid nic; do
             fwfile="/etc/pve/firewall/${vmid}.fw"
-            tag_line="|OUT Finger(DROP) -enable 0 -i ${nic} # @neo:disable"
+            tag_line="|OUT Finger(DROP) -i ${nic} # @neo:disable"
 
             # Ensure .fw exists with a [RULES] section
             if [ ! -f "$fwfile" ]; then

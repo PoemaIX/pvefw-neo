@@ -189,12 +189,12 @@ check "SG sg_web: HTTPS rule inlined in vm_veth2004i0_in" "yes" "$R"
 
 
 echo ""
-echo "── 6. @neo:notrack + @neo:mac primitive ──"
+echo "── 6. @neo:notrack + @neo:srcmac decorator ──"
 
-# 6a. Verify notrack+mac rule in raw_prerouting
+# 6a. Verify notrack+srcmac rule in raw_prerouting
 R=$(nft list chain bridge pvefw-neo raw_prerouting 2>&1 | grep -c "ether saddr 02:00:00:aa:03:00.*saddr 10.99.0.13")
 [ "$R" -ge 1 ] && R="yes" || R="no"
-check "notrack+mac: MAC+IP rule in raw_prerouting" "yes" "$R"
+check "notrack+srcmac: MAC+IP rule in raw_prerouting" "yes" "$R"
 
 # 6b. notrack DROP-all rule present
 R=$(nft list chain bridge pvefw-neo raw_prerouting 2>&1 | grep 'iifname "veth2003i0" drop' | wc -l)
@@ -203,7 +203,7 @@ check "notrack: DROP-all fallback in raw_prerouting" "yes" "$R"
 
 # 6c. Functional: traffic still works (combined sugar+notrack allow the right packets)
 R=$(pct exec 2003 -- ping -c 1 -W 2 10.99.0.14 2>&1 | grep -c "1 received")
-check "notrack+mac: legitimate traffic still passes" "1" "$R"
+check "notrack+srcmac: legitimate traffic still passes" "1" "$R"
 
 
 echo ""

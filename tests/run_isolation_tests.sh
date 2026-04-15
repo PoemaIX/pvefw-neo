@@ -11,7 +11,7 @@
 set -u
 
 PASS=0; FAIL=0
-ISOLATION_LINE='|OUT Finger(DROP) -enable 0 -i net0 # @neo:isolated'
+ISOLATION_LINE='|OUT Finger(DROP) -i net0 # @neo:isolated'
 
 # Cleanup on exit: remove isolation tags
 cleanup() {

@@ -113,7 +113,17 @@ class NftRenderer:
         if "src_mac" in l2:
             parts.append(f"ether saddr {l2['src_mac']}")
         if "src_mac_neg" in l2:
-            parts.append(f"ether saddr != {l2['src_mac_neg']}")
+            neg = l2["src_mac_neg"]
+            if isinstance(neg, list):
+                if len(neg) == 1:
+                    parts.append(f"ether saddr != {neg[0]}")
+                else:
+                    parts.append("ether saddr != { " + ", ".join(neg) + " }")
+            else:
+                parts.append(f"ether saddr != {neg}")
+        if "src_mac_mask" in l2:
+            addr, mask = l2["src_mac_mask"]
+            parts.append(f"ether saddr & {mask} == {addr}")
         if "dst_mac" in l2:
             parts.append(f"ether daddr {l2['dst_mac']}")
         if "dst_mac_mask" in l2:
@@ -153,16 +163,33 @@ class NftRenderer:
         if "dst_ip" in l3:
             parts.append(f"{ip_pfx} daddr {l3['dst_ip']}")
         if "src_set" in l3:
-            self._used_sets.add(l3["src_set"])
-            parts.append(f"{ip_pfx} saddr @{l3['src_set']}")
+            sname = l3["src_set"]
+            self._used_sets.add(sname)
+            parts.append(f"{ip_pfx} saddr @{sname}")
+            # Mirror PVE official behavior: per-IPSet, negative members live
+            # in a sibling `<name>_nomatch` set. Rule must require source
+            # NOT in the nomatch set as well.
+            ns = self.rs.sets.get(sname)
+            if ns and ns.excludes:
+                parts.append(f"{ip_pfx} saddr != @{sname}_nomatch")
         if "dst_set" in l3:
-            self._used_sets.add(l3["dst_set"])
-            parts.append(f"{ip_pfx} daddr @{l3['dst_set']}")
+            sname = l3["dst_set"]
+            self._used_sets.add(sname)
+            parts.append(f"{ip_pfx} daddr @{sname}")
+            ns = self.rs.sets.get(sname)
+            if ns and ns.excludes:
+                parts.append(f"{ip_pfx} daddr != @{sname}_nomatch")
 
         if "proto" in l3:
             proto = self._proto_to_nft(l3["proto"])
             parts.append(f"meta l4proto {proto}")
 
+        if "icmp_type" in l3:
+            types = l3["icmp_type"]
+            if len(types) == 1:
+                parts.append(f"icmp type {types[0]}")
+            else:
+                parts.append("icmp type { " + ", ".join(types) + " }")
         if "icmpv6_type" in l3:
             types = l3["icmpv6_type"]
             if len(types) == 1:
@@ -229,7 +256,13 @@ class NftRenderer:
             self._raw_rules.append(f"{iface_prefix} {line}")
 
     def _handle_stateful(self, devname, netdev, rule):
-        """STATEFUL rule → per-(devname, direction) sub-chain."""
+        """STATEFUL rule → per-(devname, direction) sub-chain.
+
+        When `rule.log_level` is set we emit a *separate* log rule with the
+        same match conditions before the verdict rule. Mirrors official
+        Rust impl `RuleMatch::to_nft_rules` which pushes a log NftRule first
+        and then the verdict NftRule, both carrying identical match clauses.
+        """
         self._stateful_devs.add(devname)
         key = (devname, rule.direction)
         match_parts = self._render_match(rule.match)
@@ -240,8 +273,37 @@ class NftRenderer:
         if rule.direction == ir.Direction.OUT and action == "accept":
             action = "return"
 
-        line = " ".join(match_parts + [action])
-        self._fwd_chains.setdefault(key, []).append(line.strip())
+        chain = self._fwd_chains.setdefault(key, [])
+
+        if rule.log_level:
+            log_clause = self._log_clause(
+                netdev.vmid, rule.log_level, key, action,
+            )
+            chain.append(" ".join(match_parts + [log_clause]).strip())
+
+        chain.append(" ".join(match_parts + [action]).strip())
+
+    # nflog_level mapping mirrors official LogLevel::nflog_level()
+    # (proxmox-nftables/src/statement.rs:232).
+    _NFLOG_LEVEL = {
+        "emerg": 0, "alert": 1, "crit": 2, "err": 3,
+        "warning": 4, "notice": 5, "info": 6, "debug": 7,
+    }
+
+    @classmethod
+    def _log_clause(cls, vmid, level, chain_key, verdict):
+        """Build a rate-limited `nflog` clause.
+
+        Prefix format is bit-for-bit `Log::generate_prefix`:
+          ":<vmid>:<nflog_level>:<chain_name>: <verdict>: "
+        Group 0, matching official.
+        """
+        devname, direction = chain_key
+        dir_tag = "in" if direction == ir.Direction.IN else "out"
+        chain_name = f"guest-{vmid or 0}-{dir_tag}"
+        nflog_lvl = cls._NFLOG_LEVEL.get(level, 6)
+        prefix = f":{vmid or 0}:{nflog_lvl}:{chain_name}: {verdict}: "
+        return f'limit rate 10/second log prefix "{prefix}" group 0'
 
     @staticmethod
     def _iface_prefix(devname, direction):
@@ -286,7 +348,10 @@ class NftRenderer:
         lines.append("# ═══ bridge family ═══")
         lines.append("table bridge pvefw-neo {")
 
-        # Named sets (only those actually used)
+        # Named sets (only those actually used).
+        # Per PVE official: each IPSet that has negative members emits a
+        # paired `<name>_nomatch` set. Empty sets are still declared so
+        # rules referencing them stay valid.
         for set_name in sorted(self._used_sets):
             ns = self.rs.sets.get(set_name)
             if not ns:
@@ -294,9 +359,16 @@ class NftRenderer:
             nft_type = "ipv4_addr" if ns.family == "ipv4" else "ipv6_addr"
             lines.append(f"    set {ns.name} {{")
             lines.append(f"        type {nft_type}; flags interval;")
-            elems = ", ".join(ns.elements)
-            lines.append(f"        elements = {{ {elems} }}")
+            if ns.elements:
+                elems = ", ".join(ns.elements)
+                lines.append(f"        elements = {{ {elems} }}")
             lines.append("    }")
+            if ns.excludes:
+                lines.append(f"    set {ns.name}_nomatch {{")
+                lines.append(f"        type {nft_type}; flags interval;")
+                elems = ", ".join(ns.excludes)
+                lines.append(f"        elements = {{ {elems} }}")
+                lines.append("    }")
 
         # raw_prerouting (stateless with L3+)
         lines.append("")

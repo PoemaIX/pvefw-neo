@@ -23,9 +23,33 @@ NetDev with no STATEFUL rules → no table 30/31 entries → packets fall throug
 to default NORMAL action without entering ct().
 """
 
+import copy
+import ipaddress
 import subprocess
+import sys
 
 from . import ir
+
+
+# ICMPv4 type name → numeric type map. Mirrors the subset PVE/iptables
+# commonly accept; anything else passes through as a literal.
+ICMP_TYPE_NUM = {
+    "echo-reply": 0,
+    "destination-unreachable": 3,
+    "source-quench": 4,
+    "redirect": 5,
+    "echo-request": 8,
+    "router-advertisement": 9,
+    "router-solicitation": 10,
+    "time-exceeded": 11,
+    "parameter-problem": 12,
+    "timestamp-request": 13,
+    "timestamp-reply": 14,
+    "info-request": 15,
+    "info-reply": 16,
+    "address-mask-request": 17,
+    "address-mask-reply": 18,
+}
 
 
 # OVS table assignments
@@ -199,12 +223,31 @@ class OvsRenderer:
         # ── L2 src_mac/dst_mac ──
         if "src_mac" in l2:
             parts.append(f"dl_src={l2['src_mac'].lower()}")
+        if "src_mac_mask" in l2:
+            addr, mask = l2["src_mac_mask"]
+            parts.append(f"dl_src={addr.lower()}/{mask.lower()}")
         # src_mac_neg handled at higher level (split into 2 flows)
         if "dst_mac" in l2:
             parts.append(f"dl_dst={l2['dst_mac'].lower()}")
         if "dst_mac_mask" in l2:
             addr, mask = l2["dst_mac_mask"]
-            parts.append(f"dl_dst={addr}/{mask}")
+            parts.append(f"dl_dst={addr.lower()}/{mask.lower()}")
+
+        # ── VLAN ──
+        # `vlan_id` matches frames on a specific 802.1Q VLAN; `ether_type_neg
+        # == vlan` means "untagged" (no VLAN tag present). Multi-vid OR is
+        # handled by the caller emitting N flows at the same priority, the
+        # same way arp_op sets are expanded.
+        if "vlan_id" in l2:
+            vids = l2["vlan_id"]
+            # Caller splits list into separate flows; here render whichever
+            # we were given (first element if a list sneaks through).
+            vid = vids[0] if isinstance(vids, list) else vids
+            parts.append(f"dl_vlan={vid}")
+        if l2.get("ether_type_neg") == "vlan":
+            # vlan_tci bit 0x1000 is the VID-present flag (CFI). Matching
+            # vlan_tci=0x0000/0x1000 selects frames with no VLAN tag.
+            parts.append("vlan_tci=0x0000/0x1000")
 
         # ── ARP ──
         if "arp_op" in l2:
@@ -243,6 +286,20 @@ class OvsRenderer:
                     pass
 
         # ICMPv6 type
+        if "icmp_type" in l3:
+            types = l3["icmp_type"]
+            if len(types) == 1:
+                num = ICMP_TYPE_NUM.get(types[0])
+                if num is not None:
+                    parts.append(f"icmp_type={num}")
+                else:
+                    parts.append(f"icmp_type={types[0]}")
+            else:
+                # OVS has no list match for icmp_type — the variant expander
+                # splits an N-type rule into N flows before calling us.
+                num = ICMP_TYPE_NUM.get(types[0])
+                if num is not None:
+                    parts.append(f"icmp_type={num}")
         if "icmpv6_type" in l3:
             types = l3["icmpv6_type"]
             if len(types) >= 1:
@@ -376,15 +433,16 @@ class OvsRenderer:
     # ─────────────────── per-rule emitters ───────────────────
 
     def _emit_macfilter(self, devname, ofport, rule, prio):
-        """macspoof: src_mac_neg → 2 flows (allow correct, drop rest)."""
+        """macspoof: src_mac_neg → N+1 flows (allow each whitelisted MAC at
+        higher priority, drop everything else at lower priority)."""
         l2 = rule.match["l2"]
-        mac = l2["src_mac_neg"].lower()
-        # Allow correct MAC
-        self.flows.append(self._emit(
-            TBL_INGRESS, prio,
-            [f"in_port={ofport}", f"dl_src={mac}"],
-            f"resubmit(,{TBL_RAW})"))
-        # Drop everything else from this in_port
+        neg = l2["src_mac_neg"]
+        macs = neg if isinstance(neg, list) else [neg]
+        for mac in macs:
+            self.flows.append(self._emit(
+                TBL_INGRESS, prio,
+                [f"in_port={ofport}", f"dl_src={mac.lower()}"],
+                f"resubmit(,{TBL_RAW})"))
         self.flows.append(self._emit(
             TBL_INGRESS, prio - 1,
             [f"in_port={ofport}"],
@@ -392,25 +450,28 @@ class OvsRenderer:
         return prio - 2
 
     def _emit_stateless(self, devname, ofport, rule, prio):
-        """STATELESS rule → table 10 with in_port match."""
-        # Handle arp_op set: split into multiple flows
-        l2 = rule.match.get("l2", {})
-        ops = l2.get("arp_op", [])
+        """STATELESS rule → table 10 with in_port match.
 
+        Pipeline: L2 list-valued fields (arp_op, vlan_id) → ipset variants
+        (src_set/dst_set). All resulting flows share the same priority so
+        set / OR-list elements are semantically peers of a single .fw rule.
+        """
         action = "drop" if rule.action == "drop" else f"resubmit(,{TBL_CT_SEND})"
-
-        if len(ops) > 1:
-            for op in ops:
-                m = self._expand_match_with_arp_op(rule.match, op)
-                self.flows.append(self._emit(
-                    TBL_RAW, prio, [f"in_port={ofport}"] + m, action))
-                prio -= 1
-        else:
-            m = self._expand_match(rule.match)
+        variants = self._expand_variants(rule.match)
+        if not variants:
+            return prio
+        for v in variants:
+            parts = self._expand_match(v)
             self.flows.append(self._emit(
-                TBL_RAW, prio, [f"in_port={ofport}"] + m, action))
-            prio -= 1
-        return prio
+                TBL_RAW, prio, [f"in_port={ofport}"] + parts, action))
+        return prio - 1
+
+    def _expand_variants(self, match):
+        """Full L2+ipset expansion pipeline. Returns list of matches."""
+        variants = []
+        for l2m in self._expand_l2_variants(match):
+            variants.extend(self._expand_set_variants(l2m))
+        return variants
 
     def _expand_match_with_arp_op(self, m, op):
         """Render match with a specific single arp_op value."""
@@ -418,9 +479,156 @@ class OvsRenderer:
         m2["l2"]["arp_op"] = [op]
         return self._expand_match(m2)
 
+    def _expand_l2_variants(self, match):
+        """Split a match containing list-valued L2 fields into N singleton
+        matches. Handles `arp_op` and `vlan_id` (both OR-lists in the IR).
+
+        OVS has no "field IN {a, b}" match for these fields; we emit one
+        flow per element at the same priority, matching nft `{a, b}` set
+        semantic via OR-at-the-priority-band level.
+        """
+        variants = [match]
+        out = []
+        for v in variants:
+            l2 = v.get("l2", {})
+            arp_ops = l2.get("arp_op", [])
+            if isinstance(arp_ops, list) and len(arp_ops) > 1:
+                for op in arp_ops:
+                    clone = copy.deepcopy(v)
+                    clone["l2"]["arp_op"] = [op]
+                    out.append(clone)
+            else:
+                out.append(v)
+
+        variants = out
+        out = []
+        for v in variants:
+            l2 = v.get("l2", {})
+            vids = l2.get("vlan_id", [])
+            if isinstance(vids, list) and len(vids) > 1:
+                for vid in vids:
+                    clone = copy.deepcopy(v)
+                    clone["l2"]["vlan_id"] = [vid]
+                    out.append(clone)
+            else:
+                out.append(v)
+        return out
+
+    # ─────────────────── ipset expansion (Strategy A) ───────────────────
+    #
+    # OVS has no set-membership match, so a rule referencing an ipset is
+    # expanded into N flows — one per effective CIDR. "Effective CIDR list"
+    # = elements − excludes, computed via IPv{4,6}Network.address_exclude()
+    # which splits a network into disjoint pieces when a nested block is
+    # carved out. For PVE's nomatch-in-ipset feature, this gives us
+    # semantically exact results without per-rule OVS tables.
+    #
+    # Fragment count bound: excluding one /32 from a /24 produces 24
+    # networks; each additional exclusion can double. For typical PVE
+    # ipsets (a few excludes in broader ranges) fragmentation stays small;
+    # worst case is bounded by the set size × prefix-length budget.
+
+    def _effective_cidrs(self, set_name):
+        """Return (family, list[str]) — effective CIDR list for an ipset.
+
+        Positives minus excludes, using ipaddress CIDR arithmetic. Family
+        is "ipv4" or "ipv6" taken from the NamedSet. Returns an empty list
+        if the set reduces to nothing (every positive is masked out).
+        """
+        ns = self.rs.sets.get(set_name)
+        if not ns:
+            return None, []
+
+        Net = ipaddress.IPv4Network if ns.family == "ipv4" else ipaddress.IPv6Network
+
+        def _parse(s):
+            try:
+                return Net(s, strict=False)
+            except ValueError:
+                return None
+
+        pos_nets = [n for n in (_parse(e) for e in ns.elements) if n is not None]
+        exc_nets = [n for n in (_parse(e) for e in ns.excludes) if n is not None]
+
+        for ex in exc_nets:
+            survivors = []
+            for pn in pos_nets:
+                if not pn.overlaps(ex):
+                    survivors.append(pn)
+                    continue
+                # Any two CIDRs are identical, one contains the other, or
+                # disjoint — never partially overlapping. If pn is inside
+                # ex (or equal) it's fully removed; otherwise carve ex out.
+                if pn.subnet_of(ex):
+                    continue
+                survivors.extend(pn.address_exclude(ex))
+            pos_nets = survivors
+
+        return ns.family, [str(n) for n in pos_nets]
+
+    def _expand_set_variants(self, match):
+        """Return list[match_dict] with src_set/dst_set flattened to literals.
+
+        Cross-product when both sides reference sets: |src| × |dst| variants.
+        Empty list if any referenced side resolves to zero effective CIDRs
+        (rule can never match, same as PVE behavior).
+        """
+        l3 = match.get("l3", {})
+        src_set = l3.get("src_set")
+        dst_set = l3.get("dst_set")
+        if not src_set and not dst_set:
+            return [match]
+
+        if src_set:
+            _, src_cidrs = self._effective_cidrs(src_set)
+            if not src_cidrs:
+                return []
+        else:
+            src_cidrs = [None]
+
+        if dst_set:
+            _, dst_cidrs = self._effective_cidrs(dst_set)
+            if not dst_cidrs:
+                return []
+        else:
+            dst_cidrs = [None]
+
+        variants = []
+        for s in src_cidrs:
+            for d in dst_cidrs:
+                m = copy.deepcopy(match)
+                m.setdefault("l3", {}).pop("src_set", None)
+                m["l3"].pop("dst_set", None)
+                if s is not None:
+                    m["l3"]["src_ip"] = s
+                if d is not None:
+                    m["l3"]["dst_ip"] = d
+                variants.append(m)
+        return variants
+
+    def _warn_log_unsupported(self, rule):
+        """Print a one-shot warning for rules with log_level on OVS.
+
+        OVS has no nflog equivalent. The flow is still emitted — we just
+        skip the log side-effect. Warning is rate-limited per render.
+        """
+        if not getattr(rule, "log_level", None):
+            return
+        if not hasattr(self, "_warned_log"):
+            self._warned_log = True
+            print(
+                "WARNING: pvefw-neo OVS backend does not support -log; "
+                "rule logging is silently dropped on OVS bridges. Switch "
+                "the bridge to Linux+nftables if you need per-rule logs.",
+                file=sys.stderr, flush=True,
+            )
+
     def _emit_stateful_out(self, devname, ofport, rule, prio):
         """STATEFUL OUT rule → table 30 in_port match."""
-        m = self._expand_match(rule.match)
+        self._warn_log_unsupported(rule)
+        variants = self._expand_variants(rule.match)
+        if not variants:
+            return prio
         if rule.action == "drop":
             action = "drop"
         else:  # accept (return semantics not needed in OVS — table 30 falls to 31)
@@ -428,20 +636,27 @@ class OvsRenderer:
             has_l3 = bool(rule.match.get("l3") or rule.match.get("l4"))
             action = f"ct(commit),resubmit(,{TBL_FWD_IN})" if has_l3 \
                      else f"resubmit(,{TBL_FWD_IN})"
-        self.flows.append(self._emit(
-            TBL_FWD_OUT, prio, [f"in_port={ofport}"] + m, action))
+        for v in variants:
+            parts = self._expand_match(v)
+            self.flows.append(self._emit(
+                TBL_FWD_OUT, prio, [f"in_port={ofport}"] + parts, action))
         return prio - 1
 
     def _emit_stateful_in(self, devname, mac, rule, prio):
         """STATEFUL IN rule → table 31 dl_dst match."""
-        m = self._expand_match(rule.match)
+        self._warn_log_unsupported(rule)
+        variants = self._expand_variants(rule.match)
+        if not variants:
+            return prio
         if rule.action == "drop":
             action = "drop"
         else:
             has_l3 = bool(rule.match.get("l3") or rule.match.get("l4"))
             action = "ct(commit),NORMAL" if has_l3 else "NORMAL"
-        self.flows.append(self._emit(
-            TBL_FWD_IN, prio, [f"dl_dst={mac}"] + m, action))
+        for v in variants:
+            parts = self._expand_match(v)
+            self.flows.append(self._emit(
+                TBL_FWD_IN, prio, [f"dl_dst={mac}"] + parts, action))
         return prio - 1
 
     # ─────────────────── isolation ───────────────────
