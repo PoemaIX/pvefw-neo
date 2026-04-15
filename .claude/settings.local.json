@@ -10,7 +10,10 @@
       "Bash(systemctl is-active:*)",
       "Read(//usr/share/perl5/PVE/**)",
       "Read(//etc/pve/nodes/pvedevvm/lxc/**)",
-      "Bash(pveam list:*)"
+      "Bash(pveam list:*)",
+      "Bash(qm config:*)",
+      "Bash(pct config:*)",
+      "Bash(python3:*)"
     ]
   }
 }

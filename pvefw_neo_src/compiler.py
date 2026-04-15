@@ -278,10 +278,21 @@ class Compiler:
             ))
 
     def _sugar_ipspoof(self, vmid, config, nets, is_ct, rule, tag):
-        """@neo:ipspoof → STATELESS rules: ARP whitelist + IPv4/IPv6 src whitelist."""
-        if not tag.args:
+        """@neo:ipspoof → STATELESS rules: ARP whitelist + IPv4/IPv6 src whitelist.
+
+        IP list comes from either the tag args (legacy:
+        `# @neo:ipspoof 10.0.0.1,10.0.0.2`) or the rule's Source field
+        (preferred: leave comment as `# @neo:ipspoof` and put the IPs in
+        the WebUI Source field, which PVE already renders as a dedicated
+        input box).
+        """
+        if tag.args:
+            raw = tag.args[0]
+        elif rule.source:
+            raw = rule.source
+        else:
             return
-        ips = tag.args[0].split(",")
+        ips = raw.split(",")
         v4_ips = [ip for ip in ips if is_ipv4(ip.split("/")[0])]
         v6_ips = [ip for ip in ips if is_ipv6(ip.split("/")[0])]
 

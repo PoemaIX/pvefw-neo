@@ -70,47 +70,63 @@ match any real protocol, we borrow the long-obsolete **Finger** macro
 as **disabled** in PVE (so PVE itself ignores it), and put the real
 meaning in the comment.
 
-**WebUI recipe** (`VM → Firewall → Add`):
+**WebUI recipe** (`VM → Firewall → Add`) — shared skeleton for every
+extension rule:
 
 | Field | Value |
 |---|---|
 | Direction | `out` |
-| Enable | **unchecked** ← important |
+| **Enable** | **unchecked** ← important |
 | Action | `DROP` |
 | Macro | `Finger` |
-| Source | (IP-type args, if applicable) |
-| Comment | `@neo:<name> [args]` |
+| Source / Comment | filled per tag (see below) |
 
-> PVE marks a rule disabled by prepending `|` to the line. That's
-> exactly what we want: PVE skips it, pvefw-neo picks it up.
+> PVE marks a rule disabled by prepending `|` to the underlying `.fw`
+> line. That's exactly what we want: PVE skips it, pvefw-neo picks it up.
 
 | Tag | Effect |
 |---|---|
 | `@neo:disable` | **Debug switch.** Turn off pvefw-neo management for this port entirely — all other rules on this port are ignored and traffic passes through. Equivalent to "port-level firewall disable" in PVE's model (and the reason we can't use the PVE GUI flag: that flag would also turn off the checkbox that gates fwbr creation). |
 | `@neo:isolated` | Linux bridge `isolated on` / the equivalent OF rule on OVS. Two isolated ports on the same bridge can't talk to each other; isolated ↔ non-isolated still works. |
 | `@neo:macspoof [mac,...]` | Drop frames whose source MAC isn't in the list. Empty list = auto-read from VM config. |
-| `@neo:ipspoof <ip,...>` | Allow only the listed source IPs. Auto-handles ARP, IPv4, IPv6 (DAD, link-local, whitelist). |
+| `@neo:ipspoof` | Allow only the listed source IPs (put them in the **Source** field). Auto-handles ARP, IPv4, IPv6 (DAD, link-local, whitelist). |
 | `@neo:nodhcp` | Block the VM from acting as a DHCP server (drop UDP sport 67/547 → dport 68/546). |
 | `@neo:nora` | Drop outbound IPv6 Router Advertisement. |
 | `@neo:nondp` | Drop outbound IPv6 NS/NA (block spoofed NDP). |
 | `@neo:mcast_limit <pps>` | Rate-limit multicast frames at netdev ingress. |
 
-**Examples:**
+**Examples** (each row shows the non-shared fields; the other WebUI
+fields follow the skeleton above):
 
-```ini
-[RULES]
-# ipspoof — allow only specific source IPs through
-|OUT Finger(DROP) # @neo:ipspoof 192.168.5.6,192.168.5.7,192.168.20.0/24
+**ipspoof** — only allow specific source IPs:
 
-# macspoof — allow only specific source MACs through
-|OUT Finger(DROP) # @neo:macspoof 22:44:66:88:aa:bb,22:44:66:88:aa:cc
+| Source | `192.168.5.6,192.168.5.7,192.168.20.0/24` |
+|---|---|
+| Comment | `@neo:ipspoof` |
 
-# macspoof — no arg: read MAC from VM config
-|OUT Finger(DROP) # @neo:macspoof
+**macspoof** — only allow specific source MACs:
 
-# nodhcp — block this VM from running a DHCP server
-|OUT Finger(DROP) # @neo:nodhcp
-```
+| Source | *(leave empty)* |
+|---|---|
+| Comment | `@neo:macspoof 22:44:66:88:aa:bb,22:44:66:88:aa:cc` |
+
+**macspoof** — auto-read MAC from VM config (no args):
+
+| Source | *(leave empty)* |
+|---|---|
+| Comment | `@neo:macspoof` |
+
+**nodhcp** — block this VM from running a DHCP server:
+
+| Source | *(leave empty)* |
+|---|---|
+| Comment | `@neo:nodhcp` |
+
+**mcast_limit** — rate-limit multicast at 100 pps:
+
+| Source | *(leave empty)* |
+|---|---|
+| Comment | `@neo:mcast_limit 100` |
 
 ### Class 2 — Decorator tags
 
@@ -134,20 +150,22 @@ rule behavior or add extra match conditions.
 | `@neo:vlan <vid\|untagged\|vid1,vid2>` | Only match traffic on the given VLAN(s). Used when a trunk port is handed to the VM and you want a rule scoped to one inner VLAN. |
 | `@neo:rateexceed <pps>` | Only match the portion of traffic that **exceeds** `<pps>`. Packets within the rate budget fall through to the next rule. **`@neo:notrack` only** — not supported on stateful rules. |
 
-**Examples:**
+**Examples** — decorators attach to real PVE rules. Unlike extension
+rules these use **real** macros/actions and are **enabled** in the
+WebUI (no `|` prefix; Enable **checked**):
 
-```ini
-[RULES]
-# Stateless per-MAC allow + catch-all drop
-|OUT ACCEPT -i net0 -source 10.0.0.10/32 # @neo:notrack @neo:srcmac exact aa:bb:cc:dd:ee:ff
-|OUT DROP                                # @neo:notrack
+**Stateless per-MAC allow** + catch-all drop:
 
-# VLAN-scoped stateless rule (trunk port, inner VLAN 20 only)
-|OUT ACCEPT -i net0 -source 10.0.0.0/24 # @neo:notrack @neo:vlan 20
+| Direction | Action | Macro | Source | Comment |
+|---|---|---|---|---|
+| `out` | `ACCEPT` | *(none)* | `10.0.0.10/32` | `@neo:notrack @neo:srcmac exact aa:bb:cc:dd:ee:ff` |
+| `out` | `DROP`   | *(none)* | *(none)*        | `@neo:notrack` |
 
-# Rate-limit multicast at 100 pps (drop the excess)
-|OUT Finger(DROP) -i net0 # @neo:mcast_limit 100
-```
+**VLAN-scoped** stateless rule (trunk port, inner VLAN 20 only):
+
+| Direction | Action | Macro | Source | Comment |
+|---|---|---|---|---|
+| `out` | `ACCEPT` | *(none)* | `10.0.0.0/24` | `@neo:notrack @neo:vlan 20` |
 
 ### Why sugar = decorators
 

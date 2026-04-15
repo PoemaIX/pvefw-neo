@@ -64,47 +64,62 @@ bash /usr/local/lib/pvefw_neo/uninstall.sh
 規則在 PVE 裡標記為 **disabled**（PVE 會忽略它），真正的意思寫在
 comment 欄位裡。
 
-**WebUI 操作步驟**（`VM → Firewall → Add`）：
+**WebUI 操作步驟**（`VM → Firewall → Add`）— 所有 extension rule 共
+用的固定骨架：
 
 | 欄位 | 值 |
 |---|---|
 | Direction | `out` |
-| Enable | **不要打勾** ← 重要 |
+| **Enable** | **不要打勾** ← 重要 |
 | Action | `DROP` |
 | Macro | `Finger` |
-| Source | （IP 類參數，若適用） |
-| Comment | `@neo:<名稱> [參數]` |
+| Source / Comment | 依 tag 填寫（見下） |
 
-> PVE 透過在行首加 `|` 表示 rule disabled — 這正是我們想要的：PVE 自
-> 己跳過它，pvefw-neo 接手。
+> PVE 透過在底層 `.fw` 行首加 `|` 表示 rule disabled — 這正是我們想要
+> 的：PVE 自己跳過它，pvefw-neo 接手。
 
 | Tag | 效果 |
 |---|---|
 | `@neo:disable` | **除錯開關。** 關閉 pvefw-neo 對此 port 的管理，該 port 上其他規則全部忽略，流量直接放行。等同 PVE 的 "port-level firewall disable"（之所以不能用 PVE GUI 那個旗標：勾掉之後 PVE 會建立 fwbr，我們不能接受）。 |
 | `@neo:isolated` | 設定 kernel bridge `isolated on`（Linux）或對應的 OF 規則（OVS）。同 bridge 上兩個 isolated port 互相不通；isolated ↔ 非 isolated 仍可通。 |
 | `@neo:macspoof [mac,...]` | 只允許列表中的 source MAC 通過，其餘 drop。沒給參數 = 自動從 VM config 讀。 |
-| `@neo:ipspoof <ip,...>` | 只允許列出的 source IP 通過。自動處理 ARP / IPv4 / IPv6（含 DAD、link-local、白名單）。 |
+| `@neo:ipspoof` | 只允許列出的 source IP 通過（把 IP 清單填在 **Source** 欄位）。自動處理 ARP / IPv4 / IPv6（含 DAD、link-local、白名單）。 |
 | `@neo:nodhcp` | 阻止 VM 當 DHCP server（drop UDP sport 67/547 → dport 68/546）。 |
 | `@neo:nora` | 阻止外送 IPv6 Router Advertisement。 |
 | `@neo:nondp` | 阻止外送 IPv6 NS/NA（防偽造 NDP）。 |
 | `@neo:mcast_limit <pps>` | 對 netdev ingress 的 multicast 封包做 rate limit。 |
 
-**範例：**
+**範例**（每條規則只列出需要填的欄位，其他欄位照上面的骨架）：
 
-```ini
-[RULES]
-# ipspoof — 只允許部分 source IP
-|OUT Finger(DROP) # @neo:ipspoof 192.168.5.6,192.168.5.7,192.168.20.0/24
+**ipspoof** — 只允許部分 source IP：
 
-# macspoof — 只允許部分 source MAC
-|OUT Finger(DROP) # @neo:macspoof 22:44:66:88:aa:bb,22:44:66:88:aa:cc
+| Source | `192.168.5.6,192.168.5.7,192.168.20.0/24` |
+|---|---|
+| Comment | `@neo:ipspoof` |
 
-# macspoof — 不給參數（自動從 VM config 讀）
-|OUT Finger(DROP) # @neo:macspoof
+**macspoof** — 只允許部分 source MAC：
 
-# nodhcp — 禁止此 VM 成為 DHCP server
-|OUT Finger(DROP) # @neo:nodhcp
-```
+| Source | *(留空)* |
+|---|---|
+| Comment | `@neo:macspoof 22:44:66:88:aa:bb,22:44:66:88:aa:cc` |
+
+**macspoof** — 自動從 VM config 讀取 MAC（不給參數）：
+
+| Source | *(留空)* |
+|---|---|
+| Comment | `@neo:macspoof` |
+
+**nodhcp** — 禁止此 VM 成為 DHCP server：
+
+| Source | *(留空)* |
+|---|---|
+| Comment | `@neo:nodhcp` |
+
+**mcast_limit** — multicast 限速 100 pps：
+
+| Source | *(留空)* |
+|---|---|
+| Comment | `@neo:mcast_limit 100` |
 
 ### 第二類 — Decorator tags
 
@@ -128,20 +143,21 @@ Decorator 附加在**真正的** (非 Finger) PVE 規則上。有的改變規則
 | `@neo:vlan <vid\|untagged\|vid1,vid2>` | 只套用到指定 VLAN 的流量。用於 trunk port 給 VM 時，規則只作用在內層某 VLAN。 |
 | `@neo:rateexceed <pps>` | 只匹配規則條件中**超過** `<pps>` 的部分；rate 內的封包落到下一條規則。**僅限 `@neo:notrack`**，stateful 規則不支援。 |
 
-**範例：**
+**範例** — decorator 附加在**真實**的 PVE 規則上：用真的 macro / action，
+WebUI 中要**打勾 enable**（不是 `|` disabled）：
 
-```ini
-[RULES]
-# Stateless per-MAC 白名單 + catch-all drop
-|OUT ACCEPT -i net0 -source 10.0.0.10/32 # @neo:notrack @neo:srcmac exact aa:bb:cc:dd:ee:ff
-|OUT DROP                                # @neo:notrack
+**Stateless per-MAC 白名單** + catch-all drop：
 
-# VLAN-scoped stateless 規則（trunk port，只套用在內層 VLAN 20）
-|OUT ACCEPT -i net0 -source 10.0.0.0/24 # @neo:notrack @neo:vlan 20
+| Direction | Action | Macro | Source | Comment |
+|---|---|---|---|---|
+| `out` | `ACCEPT` | *(無)* | `10.0.0.10/32` | `@neo:notrack @neo:srcmac exact aa:bb:cc:dd:ee:ff` |
+| `out` | `DROP`   | *(無)* | *(無)*          | `@neo:notrack` |
 
-# 對 multicast 做 100 pps 的速率限制（drop 超出的部分）
-|OUT Finger(DROP) -i net0 # @neo:mcast_limit 100
-```
+**VLAN-scoped** stateless 規則（trunk port，只套用在內層 VLAN 20）：
+
+| Direction | Action | Macro | Source | Comment |
+|---|---|---|---|---|
+| `out` | `ACCEPT` | *(無)* | `10.0.0.0/24` | `@neo:notrack @neo:vlan 20` |
 
 ### 語法糖 = decorator 組合
 
