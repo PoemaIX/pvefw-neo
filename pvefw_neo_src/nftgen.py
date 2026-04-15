@@ -162,23 +162,38 @@ class NftRenderer:
             parts.append(f"{ip_pfx} saddr {l3['src_ip']}")
         if "dst_ip" in l3:
             parts.append(f"{ip_pfx} daddr {l3['dst_ip']}")
+        # ipset refs: pure-nomatch (empty positive + non-empty excludes) is
+        # treated as pure negation — emit only `saddr != @<set>_nomatch`.
+        # Mixed sets emit both the positive membership AND the nomatch
+        # negation (mirrors official PVE Rust impl).
+        #
+        # When the rule is on ether_type=arp, the set reference targets the
+        # ARP sender protocol address (`arp saddr ip`) rather than the
+        # regular L3 src IP. This lets @neo:ipspoof reuse one IPv4 NamedSet
+        # for both IPv4 and ARP enforcement.
+        is_arp = (l2.get("ether_type") == "arp")
+        saddr_field = "arp saddr ip" if is_arp else f"{ip_pfx} saddr"
+        daddr_field = "arp daddr ip" if is_arp else f"{ip_pfx} daddr"
         if "src_set" in l3:
             sname = l3["src_set"]
             self._used_sets.add(sname)
-            parts.append(f"{ip_pfx} saddr @{sname}")
-            # Mirror PVE official behavior: per-IPSet, negative members live
-            # in a sibling `<name>_nomatch` set. Rule must require source
-            # NOT in the nomatch set as well.
             ns = self.rs.sets.get(sname)
-            if ns and ns.excludes:
-                parts.append(f"{ip_pfx} saddr != @{sname}_nomatch")
+            if ns and not ns.elements and ns.excludes:
+                parts.append(f"{saddr_field} != @{sname}_nomatch")
+            else:
+                parts.append(f"{saddr_field} @{sname}")
+                if ns and ns.excludes:
+                    parts.append(f"{saddr_field} != @{sname}_nomatch")
         if "dst_set" in l3:
             sname = l3["dst_set"]
             self._used_sets.add(sname)
-            parts.append(f"{ip_pfx} daddr @{sname}")
             ns = self.rs.sets.get(sname)
-            if ns and ns.excludes:
-                parts.append(f"{ip_pfx} daddr != @{sname}_nomatch")
+            if ns and not ns.elements and ns.excludes:
+                parts.append(f"{daddr_field} != @{sname}_nomatch")
+            else:
+                parts.append(f"{daddr_field} @{sname}")
+                if ns and ns.excludes:
+                    parts.append(f"{daddr_field} != @{sname}_nomatch")
 
         if "proto" in l3:
             proto = self._proto_to_nft(l3["proto"])
@@ -350,19 +365,20 @@ class NftRenderer:
 
         # Named sets (only those actually used).
         # Per PVE official: each IPSet that has negative members emits a
-        # paired `<name>_nomatch` set. Empty sets are still declared so
-        # rules referencing them stay valid.
+        # paired `<name>_nomatch` set. Pure-nomatch sets (no positive
+        # members) are rendered in nftgen as set-negation only (see
+        # _render_match) and do NOT need the empty `<name>` set emitted.
         for set_name in sorted(self._used_sets):
             ns = self.rs.sets.get(set_name)
             if not ns:
                 continue
             nft_type = "ipv4_addr" if ns.family == "ipv4" else "ipv6_addr"
-            lines.append(f"    set {ns.name} {{")
-            lines.append(f"        type {nft_type}; flags interval;")
             if ns.elements:
+                lines.append(f"    set {ns.name} {{")
+                lines.append(f"        type {nft_type}; flags interval;")
                 elems = ", ".join(ns.elements)
                 lines.append(f"        elements = {{ {elems} }}")
-            lines.append("    }")
+                lines.append("    }")
             if ns.excludes:
                 lines.append(f"    set {ns.name}_nomatch {{")
                 lines.append(f"        type {nft_type}; flags interval;")

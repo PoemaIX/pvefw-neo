@@ -278,13 +278,26 @@ class Compiler:
             ))
 
     def _sugar_ipspoof(self, vmid, config, nets, is_ct, rule, tag):
-        """@neo:ipspoof → STATELESS rules: ARP whitelist + IPv4/IPv6 src whitelist.
+        """@neo:ipspoof → 3 conditional-drop rules per port (ARP / v4 / v6)
+        each referencing a pure-nomatch NamedSet carrying the allow-list.
 
-        IP list comes from either the tag args (legacy:
-        `# @neo:ipspoof 10.0.0.1,10.0.0.2`) or the rule's Source field
-        (preferred: leave comment as `# @neo:ipspoof` and put the IPs in
-        the WebUI Source field, which PVE already renders as a dedicated
-        input box).
+        The emitted IR shape is identical to what a user would get by
+        hand-writing:
+
+            [IPSET ipspoof_vm<id>_<iface>_v4]
+              !10.0.0.10
+            [IPSET ipspoof_vm<id>_<iface>_v6]
+              !fe80::/10
+              !::0
+              !2001:db8::1
+            [RULES]
+              |OUT DROP -p arp -source +ipspoof_..._v4  # @neo:notrack (ARP)
+              |OUT DROP -p ip  -source +ipspoof_..._v4  # @neo:notrack (IPv4)
+              |OUT DROP -p ip6 -source +ipspoof_..._v6  # @neo:notrack (IPv6)
+
+        IP list comes from either `rule.source` (preferred; put IPs in the
+        WebUI Source field) or legacy tag args (`# @neo:ipspoof a,b,c`).
+        Sugar disappears in IR — only sets + rules referencing them remain.
         """
         if tag.args:
             raw = tag.args[0]
@@ -292,88 +305,66 @@ class Compiler:
             raw = rule.source
         else:
             return
-        ips = raw.split(",")
-        v4_ips = [ip for ip in ips if is_ipv4(ip.split("/")[0])]
-        v6_ips = [ip for ip in ips if is_ipv6(ip.split("/")[0])]
+        ips = [ip.strip() for ip in raw.split(",") if ip.strip()]
+        v4 = [ip for ip in ips if is_ipv4(ip.split("/")[0])]
+        v6 = [ip for ip in ips if is_ipv6(ip.split("/")[0])]
 
         for iface, devname in self._get_iface_devnames(vmid, rule, nets, is_ct):
-            # ── ARP protection ──
-            if v4_ips:
-                for ip in v4_ips:
-                    ip_bare = ip.split("/")[0]
-                    self._add_rule(devname, ir.Rule(
-                        direction=ir.Direction.OUT,
-                        phase=ir.Phase.STATELESS,
-                        match={"l2": {"ether_type": "arp",
-                                      "arp_op": ["request", "reply"],
-                                      "arp_spa": ip_bare}},
-                        action="accept",
-                        comment=f"@neo:ipspoof ARP allow {ip_bare}",
-                    ))
+            if not v4 and not v6:
+                continue
+
+            base = f"ipspoof_vm{vmid}_{iface}"
+            set_v4 = f"{base}_v4"
+            set_v6 = f"{base}_v6"
+
+            # ── v4 pure-nomatch set (ARP + IPv4 share it) ──
+            if v4:
+                self.sets[set_v4] = ir.NamedSet(
+                    name=set_v4, family="ipv4",
+                    elements=[], excludes=list(v4),
+                )
+                self._set_families[set_v4] = "ipv4"
+
+                # ARP rule: drop when ARP sender IP not in allow list.
+                # nftgen picks `arp saddr ip` as the match field because
+                # ether_type=arp (see _render_match set-ref handling).
                 self._add_rule(devname, ir.Rule(
                     direction=ir.Direction.OUT,
                     phase=ir.Phase.STATELESS,
-                    match={"l2": {"ether_type": "arp"}},
+                    match={"l2": {"ether_type": "arp",
+                                  "arp_op": ["request", "reply"]},
+                           "l3": {"src_set": set_v4}},
                     action="drop",
-                    comment="@neo:ipspoof ARP drop rest",
+                    comment=f"@neo:ipspoof ARP (allow {','.join(v4)})",
+                ))
+                # IPv4 rule: drop when src_ip not in allow list.
+                self._add_rule(devname, ir.Rule(
+                    direction=ir.Direction.OUT,
+                    phase=ir.Phase.STATELESS,
+                    match={"l2": {"ether_type": "ip"},
+                           "l3": {"src_set": set_v4}},
+                    action="drop",
+                    comment=f"@neo:ipspoof IPv4 (allow {','.join(v4)})",
                 ))
 
-            # ── IPv4 protection ──
-            if v4_ips:
-                for ip in v4_ips:
-                    self._add_rule(devname, ir.Rule(
-                        direction=ir.Direction.OUT,
-                        phase=ir.Phase.STATELESS,
-                        match={"l2": {"ether_type": "ip"},
-                               "l3": {"src_ip": ip}},
-                        action="accept",
-                        comment=f"@neo:ipspoof IPv4 allow {ip}",
-                    ))
-                self._add_rule(devname, ir.Rule(
-                    direction=ir.Direction.OUT,
-                    phase=ir.Phase.STATELESS,
-                    match={"l2": {"ether_type": "ip"}},
-                    action="drop",
-                    comment="@neo:ipspoof IPv4 drop rest",
-                ))
-
-            # ── IPv6 protection (always added when any ipspoof is set) ──
-            if v6_ips or v4_ips:
-                # DAD: ::0 source NS
-                self._add_rule(devname, ir.Rule(
-                    direction=ir.Direction.OUT,
-                    phase=ir.Phase.STATELESS,
-                    match={"l2": {"ether_type": "ip6"},
-                           "l3": {"src_ip": "::0",
-                                  "icmpv6_type": ["nd-neighbor-solicit"]}},
-                    action="accept",
-                    comment="@neo:ipspoof IPv6 DAD",
-                ))
-                # Link-local
-                self._add_rule(devname, ir.Rule(
-                    direction=ir.Direction.OUT,
-                    phase=ir.Phase.STATELESS,
-                    match={"l2": {"ether_type": "ip6"},
-                           "l3": {"src_ip": "fe80::/10"}},
-                    action="accept",
-                    comment="@neo:ipspoof IPv6 link-local",
-                ))
-                for ip in v6_ips:
-                    self._add_rule(devname, ir.Rule(
-                        direction=ir.Direction.OUT,
-                        phase=ir.Phase.STATELESS,
-                        match={"l2": {"ether_type": "ip6"},
-                               "l3": {"src_ip": ip}},
-                        action="accept",
-                        comment=f"@neo:ipspoof IPv6 allow {ip}",
-                    ))
-                self._add_rule(devname, ir.Rule(
-                    direction=ir.Direction.OUT,
-                    phase=ir.Phase.STATELESS,
-                    match={"l2": {"ether_type": "ip6"}},
-                    action="drop",
-                    comment="@neo:ipspoof IPv6 drop rest",
-                ))
+            # ── v6 pure-nomatch set ──
+            # Always include link-local (fe80::/10) and DAD (::) so the
+            # VM can do Neighbor Discovery even if the user only listed
+            # v4 addresses.
+            v6_allow = list(v6) + ["fe80::/10", "::"]
+            self.sets[set_v6] = ir.NamedSet(
+                name=set_v6, family="ipv6",
+                elements=[], excludes=v6_allow,
+            )
+            self._set_families[set_v6] = "ipv6"
+            self._add_rule(devname, ir.Rule(
+                direction=ir.Direction.OUT,
+                phase=ir.Phase.STATELESS,
+                match={"l2": {"ether_type": "ip6"},
+                       "l3": {"src_set": set_v6}},
+                action="drop",
+                comment=f"@neo:ipspoof IPv6 (allow {','.join(v6_allow)})",
+            ))
 
     def _sugar_nodhcp(self, vmid, config, nets, is_ct, rule, tag):
         for iface, devname in self._get_iface_devnames(vmid, rule, nets, is_ct):
