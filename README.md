@@ -94,7 +94,7 @@ extension rule:
 | `@neo:nora` | Drop outbound IPv6 Router Advertisement. |
 | `@neo:nondp` | Drop outbound IPv6 NS/NA (block spoofed NDP). |
 | `@neo:mcast_limit <pps>` | Rate-limit multicast frames at netdev ingress. |
-| `@neo:ctinvalid` | Drop `ct_state=invalid` packets on this port (both IN + OUT). Without this, invalid packets (e.g. asymmetric routing returns) are accepted by matching rules — same as PVE's `nf_conntrack_allow_invalid=1`. |
+| `@neo:ct invalid` | Drop `ct_state=invalid` packets on this port (both IN + OUT). Without this, invalid packets (e.g. asymmetric routing returns) are accepted by matching rules — equivalent to PVE's `nf_conntrack_allow_invalid=0` when set. |
 
 **Examples** (each row shows the non-shared fields; the other WebUI
 fields follow the skeleton above):
@@ -187,12 +187,13 @@ WebUI (no `|` prefix; Enable **checked**):
 ### Why sugar = decorators
 
 `macspoof`, `ipspoof`, `nodhcp`, `nora`, `nondp`, `mcast_limit`,
-`ctinvalid` are all **sugar** over decorator rules. Each sugar tag
+`ct invalid` are all **sugar** over decorator rules. Each sugar tag
 expands into one or more decorator-based rules at compile time:
 
 ```
 # @neo:macspoof mac1,mac2
 → single stateless rule: drop if src_mac ∉ {mac1, mac2}
+  (equivalent to: @neo:stateless @neo:srcmac notin mac1,mac2)
 
 # @neo:ipspoof ip1,cidr2
 → 3 stateless rules (ARP/IPv4/IPv6): drop if src_ip ∉ allow-list
@@ -201,7 +202,7 @@ expands into one or more decorator-based rules at compile time:
 # @neo:mcast_limit 100
 → single stateless rule: drop multicast exceeding 100 pps
 
-# @neo:ctinvalid
+# @neo:ct invalid (as Finger carrier)
 → IN DROP # @neo:ct invalid
   OUT DROP # @neo:ct invalid
 ```

@@ -194,7 +194,7 @@ test_srcmac_bitmask_linux() {
     fw_enable vm ACCEPT ACCEPT
     # bitmask 00:00:00:00:00:00 never matches → rule inert, traffic passes
     fw_rule vm DROP out --iface "$iface" \
-        --comment "@neo:stateless @neo:srcmac bitmask 00:00:00:00:00:00"
+        --comment "@neo:noct @neo:srcmac bitmask 00:00:00:00:00:00"
     fw_apply
     local got
     got=$(nft list ruleset 2>/dev/null | grep -c "ether saddr & 00:00:00:00:00:00")
@@ -208,12 +208,12 @@ test_dstmac_linux() {
     local iface; iface=$(slot_iface linux 1)
     fw_enable vm ACCEPT ACCEPT
     fw_rule vm DROP out --iface "$iface" \
-        --comment "@neo:stateless @neo:dstmac exact ff:ff:ff:ff:ff:ff"
+        --comment "@neo:noct @neo:dstmac in ff:ff:ff:ff:ff:ff"
     fw_apply
     local got
     got=$(nft list ruleset 2>/dev/null | grep -c "ether daddr ff:ff:ff:ff:ff:ff")
     [ "$got" -ge 1 ] && got=yes || got=no
-    check "dstmac exact: rule rendered" "yes" "$got"
+    check "dstmac in: rule rendered" "yes" "$got"
 }
 
 # ─────────────── 10. Decorator: @neo:vlan ───────────────
@@ -221,7 +221,7 @@ test_dstmac_linux() {
 test_vlan_linux() {
     local iface; iface=$(slot_iface linux 1)
     fw_enable vm ACCEPT ACCEPT
-    fw_rule vm ACCEPT out --iface "$iface" --comment "@neo:stateless @neo:vlan 20"
+    fw_rule vm ACCEPT out --iface "$iface" --comment "@neo:noct @neo:vlan 20"
     fw_apply
     local got
     got=$(nft list ruleset 2>/dev/null | grep -c "vlan id 20")
@@ -235,7 +235,7 @@ test_rateexceed_linux() {
     local iface; iface=$(slot_iface linux 1)
     fw_enable vm ACCEPT ACCEPT
     fw_rule vm DROP out --iface "$iface" \
-        --comment "@neo:stateless @neo:rateexceed 50"
+        --comment "@neo:noct @neo:rateexceed 50"
     fw_apply
     local got
     got=$(nft list ruleset 2>/dev/null | grep -c "limit rate over 50")
@@ -342,22 +342,21 @@ test_disable_linux() {
     check "disable: traffic flows through untouched" "PASS" "$(probe_ping linux 1)"
 }
 
-# ─────────────── 5. Decorator: notrack + srcmac ───────────────
+# ─────────────── 5. Decorator: stateless + srcmac ───────────────
 
-test_notrack_srcmac_linux() {
+test_stateless_srcmac_linux() {
     local iface vm_mac
     iface=$(slot_iface linux 1)
-    # Pull the VM NIC's MAC from config (netN format: virtio=XX:..,bridge=..)
     vm_mac=$(qm config "$VMID_VM" | awk -v n="net1" '$1==n":"{print $0}' \
               | grep -oE '[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}' | head -1)
 
     fw_enable vm ACCEPT ACCEPT
     # pvesh prepends: create bottom-up so final order is ACCEPT (pos 0) then DROP.
-    fw_rule vm DROP out --iface "$iface" --comment "@neo:stateless"
+    fw_rule vm DROP out --iface "$iface" --comment "@neo:noct"
     fw_rule vm ACCEPT out --iface "$iface" \
-        --comment "@neo:stateless @neo:srcmac exact $vm_mac"
+        --comment "@neo:noct @neo:srcmac in $vm_mac"
     fw_apply
-    check "notrack+srcmac exact: matching MAC passes" "PASS" "$(probe_ping linux 1)"
+    check "stateless+srcmac in: matching MAC passes" "PASS" "$(probe_ping linux 1)"
 }
 
 # ─────────────── 6. PVE native: basic allow/drop ───────────────
@@ -507,7 +506,7 @@ run_test "Ext:isolated"        test_isolated_linux
 run_test "Ext:disable"         test_disable_linux
 
 # Decorators (one at a time)
-run_test "Dec:notrack+srcmac exact" test_notrack_srcmac_linux
+run_test "Dec:stateless+srcmac in" test_stateless_srcmac_linux
 run_test "Dec:srcmac bitmask"       test_srcmac_bitmask_linux
 run_test "Dec:dstmac"               test_dstmac_linux
 run_test "Dec:vlan"                 test_vlan_linux

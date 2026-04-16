@@ -251,7 +251,7 @@ class Compiler:
                 "nondp":       self._sugar_nondp,
                 "mcast_limit": self._sugar_mcast_limit,
                 "isolated":    self._sugar_isolated,
-                "ctinvalid":   self._sugar_ctinvalid,
+                "ct":          self._sugar_ct,
                 "disable":     self._sugar_disable,
             }.get(tag.name)
             if handler:
@@ -434,16 +434,23 @@ class Compiler:
             if nd:
                 nd.isolated = True
 
-    def _sugar_ctinvalid(self, vmid, config, nets, is_ct, rule, tag):
-        """@neo:ctinvalid → expands to IN DROP + OUT DROP with ct_state=invalid."""
+    def _sugar_ct(self, vmid, config, nets, is_ct, rule, tag):
+        """@neo:ct <state> as sugar (Finger carrier) → IN DROP + OUT DROP
+        with ct_state=<state>. e.g. @neo:ct invalid drops invalid on both
+        directions for the port."""
+        if not tag.args:
+            return
+        state = tag.args[0].lower()
+        if state not in ("new", "invalid"):
+            return
         for iface, devname in self._get_iface_devnames(vmid, rule, nets, is_ct):
             for direction in (ir.Direction.IN, ir.Direction.OUT):
                 self._add_rule(devname, ir.Rule(
                     direction=direction,
                     phase=ir.Phase.STATEFUL,
-                    match={"l3": {"ct_state": "invalid"}},
+                    match={"l3": {"ct_state": state}},
                     action="drop",
-                    comment="@neo:ctinvalid",
+                    comment=f"@neo:ct {state}",
                 ))
 
     def _sugar_disable(self, vmid, config, nets, is_ct, rule, tag):
@@ -475,17 +482,16 @@ class Compiler:
         """Apply @neo:srcmac / @neo:dstmac / @neo:vlan decorators onto an L2
         match dict.
 
-        Shared by notrack and stateful paths so a rule like
-        `|IN ACCEPT -p tcp -dport 22 # @neo:srcmac exact 02:00:00:AA:03:00`
+        Shared by stateless and stateful paths so a rule like
+        `|IN ACCEPT -p tcp -dport 22 # @neo:srcmac in 02:00:00:AA:03:00`
         works uniformly — decorator conditions are AND'd with the rule's
         natural L3/L4 match.
 
         Syntax:
-          @neo:srcmac exact <mac>        ether saddr == mac
+          @neo:srcmac in <mac[,mac2]>    ether saddr ∈ {list}
+          @neo:srcmac notin <mac[,mac2]> ether saddr ∉ {list}
           @neo:srcmac bitmask <mac>      ether saddr & mac == mac
-          @neo:dstmac exact <mac>        ether daddr == mac
-          @neo:dstmac bitmask <mac>      ether daddr & mac == mac
-        A bare `@neo:srcmac <mac>` (no mode) defaults to `exact`.
+        A bare `@neo:srcmac <mac>` (no mode) defaults to `in`.
         """
         for tag_name, pos_key, neg_key, mask_key in (
             ("srcmac", "src_mac", "src_mac_neg", "src_mac_mask"),
@@ -495,9 +501,9 @@ class Compiler:
             if not tag or not tag.args:
                 continue
             # Syntax: @neo:srcmac <mode> <mac[,mac2,...]>
-            #   mode: in | notin | exact (alias for in) | bitmask
+            #   mode: in | notin | bitmask
             args = list(tag.args)
-            if args[0].lower() in ("in", "notin", "exact", "bitmask"):
+            if args[0].lower() in ("in", "notin", "bitmask"):
                 mode = args.pop(0).lower()
             else:
                 mode = "in"
@@ -556,7 +562,7 @@ class Compiler:
             match.setdefault("l3", {})["ct_state"] = default_state
 
     def _build_notrack_rules(self, vmid, config, devname, rule):
-        """Build IR rules for a @neo:notrack rule."""
+        """Build IR rules for a @neo:noct / @neo:stateless rule."""
         base_match = {"l2": {}, "l3": {}, "l4": {}}
 
         self._apply_l2_primitives(base_match, rule)
@@ -614,7 +620,7 @@ class Compiler:
         if rule.get_neo_tag("rateexceed"):
             print(
                 f"WARNING: vm{vmid} line {rule.line_num}: @neo:rateexceed "
-                f"is only supported on @neo:notrack rules; decorator ignored.",
+                f"is only supported on @neo:noct/stateless rules; decorator ignored.",
                 file=sys.stderr,
                 flush=True,
             )
