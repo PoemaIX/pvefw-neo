@@ -493,16 +493,81 @@ class OvsRenderer:
         Pipeline: L2 list-valued fields (arp_op, vlan_id) → ipset variants
         (src_set/dst_set). All resulting flows share the same priority so
         set / OR-list elements are semantically peers of a single .fw rule.
+
+        Pure-nomatch sets (elements=[], excludes=[allowed]) get special
+        handling: per-allowed-IP "pass" flows at high prio + family
+        catchall drop at low prio. Same pattern as macfilter but for L3.
         """
         action = "drop" if rule.action == "drop" else f"resubmit(,{TBL_CT_SEND})"
-        variants = self._expand_variants(rule.match)
-        if not variants:
-            return prio
-        for v in variants:
-            parts = self._expand_match(v)
+        pass_action = f"resubmit(,{TBL_CT_SEND})"
+
+        for l2m in self._expand_l2_variants(rule.match):
+            neg_result = self._try_emit_pure_neg(
+                l2m, ofport, prio, pass_action)
+            if neg_result is not None:
+                prio = neg_result
+                continue
+            # Normal path: expand sets via CIDR subtraction
+            for v in self._expand_set_variants(l2m):
+                parts = self._expand_match(v)
+                self.flows.append(self._emit(
+                    TBL_RAW, prio, [f"in_port={ofport}"] + parts, action))
+            prio -= 1
+        return prio
+
+    def _try_emit_pure_neg(self, match, ofport, prio, pass_action):
+        """If match references a pure-nomatch set (src or dst), emit inverted
+        flows: per-allowed-IP pass + family catchall drop. Returns new prio
+        if handled, None otherwise.
+
+        Because ipspoof's ARP/v4/v6 rules use different ether_types, their
+        catchall drops are mutually exclusive (arp vs ip vs ipv6), so
+        multiple pure-neg rules on the same port compose correctly within
+        a single table via priority bands.
+        """
+        l3 = match.get("l3", {})
+        for set_key, field_fn in (
+            ("src_set", self._neg_ip_field_src),
+            ("dst_set", self._neg_ip_field_dst),
+        ):
+            sname = l3.get(set_key)
+            if not sname:
+                continue
+            ns = self.rs.sets.get(sname)
+            if not ns or ns.elements or not ns.excludes:
+                continue
+            # Pure-nomatch detected. Build base match without the set ref.
+            base = copy.deepcopy(match)
+            base["l3"].pop(set_key, None)
+            base_parts = self._expand_match(base)
+            ip_field = field_fn(base.get("l2", {}), ns.family)
+            # Allow flow per excluded (= allowed) IP
+            for ip in ns.excludes:
+                self.flows.append(self._emit(
+                    TBL_RAW, prio,
+                    [f"in_port={ofport}"] + base_parts + [f"{ip_field}={ip}"],
+                    pass_action))
+            # Catchall drop for this family
             self.flows.append(self._emit(
-                TBL_RAW, prio, [f"in_port={ofport}"] + parts, action))
-        return prio - 1
+                TBL_RAW, prio - 1,
+                [f"in_port={ofport}"] + base_parts,
+                "drop"))
+            return prio - 2
+        return None
+
+    @staticmethod
+    def _neg_ip_field_src(l2, family):
+        et = l2.get("ether_type")
+        if et == "arp":
+            return "arp_spa"
+        return "ipv6_src" if family == "ipv6" else "nw_src"
+
+    @staticmethod
+    def _neg_ip_field_dst(l2, family):
+        et = l2.get("ether_type")
+        if et == "arp":
+            return "arp_tpa"
+        return "ipv6_dst" if family == "ipv6" else "nw_dst"
 
     def _expand_variants(self, match):
         """Full L2+ipset expansion pipeline. Returns list of matches."""

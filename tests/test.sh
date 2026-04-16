@@ -465,6 +465,17 @@ test_spoof_combo_ovs() {
         --source "$vm_ip" --comment "@neo:ipspoof"
     fw_apply
     check "OVS macspoof+ipspoof: legit traffic passes" "PASS" "$(probe_ping ovs 1)"
+    # Negative: forged IP should be DROPPED (ipspoof pure-nomatch flows)
+    local ct_ip; ct_ip=$(slot_ip ovs 1 $CT_HOST_OCTET)
+    exec_ct "rm -f /tmp/ovs_spoof_cap; nohup sh -c 'tcpdump -i eth4 -nn -c 1 \"icmp and src host 172.30.1.99\" > /tmp/ovs_spoof_cap 2>&1' >/dev/null 2>&1 & disown" >/dev/null
+    sleep 2
+    exec_vm "hping3 -a 172.30.1.99 -1 -c 1 -I eth4 $ct_ip >/dev/null 2>&1" >/dev/null
+    sleep 3
+    exec_ct "pkill -f 'tcpdump.*172.30.1.99' 2>/dev/null; true" >/dev/null
+    local caught; caught=$(exec_ct "grep -c '172.30.1.99' /tmp/ovs_spoof_cap 2>/dev/null || echo 0" | tr -d '\r\n ')
+    local res=PASS
+    [ "${caught:-0}" -ge 1 ] && res=FAIL
+    check "OVS ipspoof: forged src IP → dropped" "PASS" "$res"
 }
 
 # ─────────────── 13. OVS backend: ipset with nomatch (CIDR pre-subtraction) ───────────────
