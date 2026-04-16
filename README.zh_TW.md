@@ -204,24 +204,37 @@ Decorator 附加在**真正的** (非 Finger) PVE 規則上。有的改變規則
 
 #### `@neo:ipspoof`
 
-只允許列出的 source IP 通過。自動處理 ARP / IPv4 / IPv6（含 DAD、link-local）。
-IP 清單填在 **Source** 欄位。
+只允許列出的 source IP 通過。自動處理 ARP / IPv4 / IPv6。
+
+IP 清單填在 **Source** 欄位（注意：PVE Source 欄位不接受 v4/v6 混寫。
+需要同時填 v4 + v6 請用 comment 寫法：`@neo:ipspoof 10.0.0.5,2001:db8::1`）。
 
 | 欄位 | 值 |
 |---|---|
 | Source | `192.168.16.3,192.168.30.0/24` |
 | Comment | `@neo:ipspoof` |
 
-展開成 pure-nomatch ipset + 3 條 stateless 規則（ARP / v4 / v6）:
+展開成 **2 個 pure-nomatch ipset** + **3 條 stateless 規則**（ARP / v4 / v6）:
+
 ```
-[IPSET vm100_ipspoof_net0_v4]
+[IPSET ipspoof_vm100_net0_v4]       ← v4 允許清單（反向）
 !192.168.16.3
 !192.168.30.0/24
+
+[IPSET ipspoof_vm100_net0_v6]       ← v6 自動加入 link-local + DAD
+!fe80::/10
+!::
 ```
 
 | Direction | Action | Source | Comment |
 |---|---|---|---|
-| `out` | `DROP` | `+guest/vm100_ipspoof_net0_v4` | `@neo:noct` |
+| `out` | `DROP` | `+ipspoof_vm100_net0_v4` | `@neo:noct` + match `arp op {request,reply}`（ARP 保護）|
+| `out` | `DROP` | `+ipspoof_vm100_net0_v4` | `@neo:noct` + match `ether type ip`（IPv4 保護）|
+| `out` | `DROP` | `+ipspoof_vm100_net0_v6` | `@neo:noct` + match `ether type ip6`（IPv6 保護）|
+
+> IPv6 ipset 永遠自動包含 `fe80::/10`（link-local）和 `::`（DAD），
+> 確保 VM 可以正常進行 Neighbor Discovery。若使用者有額外指定 v6 位址
+>（如 `2001:db8::1`），也會加入此 ipset。
 
 ---
 
