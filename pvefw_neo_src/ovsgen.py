@@ -287,8 +287,17 @@ class OvsRenderer:
         proto = l3.get("proto")
         if proto:
             proto_num = {
-                "tcp": 6, "udp": 17,
-                "icmp": 1, "icmpv6": 58, "gre": 47,
+                "tcp": 6, "udp": 17, "udplite": 136,
+                "icmp": 1, "icmpv6": 58, "ipv6-icmp": 58,
+                "gre": 47, "esp": 50, "ah": 51,
+                "sctp": 132, "dccp": 33,
+                "igmp": 2, "ipv6": 41,
+                "ipencap": 4, "ipip": 94,
+                "ospf": 89, "pim": 103, "vrrp": 112,
+                "l2tp": 115, "isis": 124,
+                "ipv6-route": 43, "ipv6-frag": 44,
+                "ipv6-nonxt": 59, "ipv6-opts": 60,
+                "rsvp": 46, "eigrp": 88,
             }.get(proto.lower())
             if proto_num is not None:
                 parts.append(f"nw_proto={proto_num}")
@@ -296,7 +305,8 @@ class OvsRenderer:
                 try:
                     parts.append(f"nw_proto={int(proto)}")
                 except ValueError:
-                    pass
+                    print(f"WARNING: OVS unknown protocol '{proto}' — "
+                          f"rule may be too broad", file=sys.stderr)
 
         # ICMPv6 type
         if "icmp_type" in l3:

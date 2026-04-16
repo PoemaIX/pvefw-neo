@@ -337,7 +337,7 @@ class Compiler:
                                   "arp_op": ["request", "reply"]},
                            "l3": {"src_set": set_v4}},
                     action="drop",
-                    comment=f"@neo:ipspoof ARP (allow {','.join(v4)})",
+                    comment=f"@neo:noct @neo:ether arp op request,reply -source +{set_v4}",
                 ))
                 # IPv4 rule: drop when src_ip not in allow list.
                 self._add_rule(devname, ir.Rule(
@@ -346,7 +346,7 @@ class Compiler:
                     match={"l2": {"ether_type": "ip"},
                            "l3": {"src_set": set_v4}},
                     action="drop",
-                    comment=f"@neo:ipspoof IPv4 (allow {','.join(v4)})",
+                    comment=f"@neo:noct @neo:ether ip -source +{set_v4}",
                 ))
 
             # ── v6 pure-nomatch set ──
@@ -365,7 +365,7 @@ class Compiler:
                 match={"l2": {"ether_type": "ip6"},
                        "l3": {"src_set": set_v6}},
                 action="drop",
-                comment=f"@neo:ipspoof IPv6 (allow {','.join(v6_allow)})",
+                comment=f"@neo:noct @neo:ether ip6 -source +{set_v6}",
             ))
 
     def _sugar_nodhcp(self, vmid, config, nets, is_ct, rule, tag):
@@ -377,7 +377,7 @@ class Compiler:
                        "l3": {"proto": "udp"},
                        "l4": {"src_port": "67", "dst_port": "68"}},
                 action="drop",
-                comment="@neo:nodhcp v4",
+                comment="@neo:noct @neo:ether ip -p udp -sport 67 -dport 68",
             ))
             self._add_rule(devname, ir.Rule(
                 direction=ir.Direction.OUT,
@@ -386,7 +386,7 @@ class Compiler:
                        "l3": {"proto": "udp"},
                        "l4": {"src_port": "547", "dst_port": "546"}},
                 action="drop",
-                comment="@neo:nodhcp v6",
+                comment="@neo:noct @neo:ether ip6 -p udp -sport 547 -dport 546",
             ))
 
     def _sugar_nora(self, vmid, config, nets, is_ct, rule, tag):
@@ -397,7 +397,7 @@ class Compiler:
                 match={"l2": {"ether_type": "ip6"},
                        "l3": {"icmpv6_type": ["nd-router-advert"]}},
                 action="drop",
-                comment="@neo:nora",
+                comment="@neo:noct @neo:ether ip6 -icmpv6-type nd-router-advert",
             ))
 
     def _sugar_nondp(self, vmid, config, nets, is_ct, rule, tag):
@@ -409,7 +409,7 @@ class Compiler:
                        "l3": {"icmpv6_type": ["nd-neighbor-solicit",
                                               "nd-neighbor-advert"]}},
                 action="drop",
-                comment="@neo:nondp",
+                comment="@neo:noct @neo:ether ip6 -icmpv6-type nd-neighbor-solicit,nd-neighbor-advert",
             ))
 
     def _sugar_mcast_limit(self, vmid, config, nets, is_ct, rule, tag):
@@ -518,6 +518,23 @@ class Compiler:
                 match["l2"][neg_key] = macs[0] if len(macs) == 1 else macs
             else:  # in (default)
                 match["l2"][pos_key] = raw_val.upper()
+
+        # @neo:ether <type> [op <ops>]
+        #   @neo:ether arp              → ether_type=arp
+        #   @neo:ether arp op request,reply → ether_type=arp + arp_op=[request,reply]
+        #   @neo:ether ip               → ether_type=ip
+        #   @neo:ether ip6              → ether_type=ip6
+        # Not written → auto-inferred from -source/-dest address family.
+        ether_tag = rule.get_neo_tag("ether")
+        if ether_tag and ether_tag.args:
+            args = list(ether_tag.args)
+            et = args.pop(0).lower()
+            if et in ("arp", "ip", "ip6", "vlan"):
+                match["l2"]["ether_type"] = et
+            if et == "arp" and len(args) >= 2 and args[0].lower() == "op":
+                ops = [o.strip() for o in args[1].split(",") if o.strip()]
+                if ops:
+                    match["l2"]["arp_op"] = ops
 
         vlan_tag = rule.get_neo_tag("vlan")
         if vlan_tag and vlan_tag.args:
