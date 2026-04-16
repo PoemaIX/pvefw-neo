@@ -194,7 +194,7 @@ test_srcmac_bitmask_linux() {
     fw_enable vm ACCEPT ACCEPT
     # bitmask 00:00:00:00:00:00 never matches → rule inert, traffic passes
     fw_rule vm DROP out --iface "$iface" \
-        --comment "@neo:notrack @neo:srcmac bitmask 00:00:00:00:00:00"
+        --comment "@neo:stateless @neo:srcmac bitmask 00:00:00:00:00:00"
     fw_apply
     local got
     got=$(nft list ruleset 2>/dev/null | grep -c "ether saddr & 00:00:00:00:00:00")
@@ -208,7 +208,7 @@ test_dstmac_linux() {
     local iface; iface=$(slot_iface linux 1)
     fw_enable vm ACCEPT ACCEPT
     fw_rule vm DROP out --iface "$iface" \
-        --comment "@neo:notrack @neo:dstmac exact ff:ff:ff:ff:ff:ff"
+        --comment "@neo:stateless @neo:dstmac exact ff:ff:ff:ff:ff:ff"
     fw_apply
     local got
     got=$(nft list ruleset 2>/dev/null | grep -c "ether daddr ff:ff:ff:ff:ff:ff")
@@ -221,7 +221,7 @@ test_dstmac_linux() {
 test_vlan_linux() {
     local iface; iface=$(slot_iface linux 1)
     fw_enable vm ACCEPT ACCEPT
-    fw_rule vm ACCEPT out --iface "$iface" --comment "@neo:notrack @neo:vlan 20"
+    fw_rule vm ACCEPT out --iface "$iface" --comment "@neo:stateless @neo:vlan 20"
     fw_apply
     local got
     got=$(nft list ruleset 2>/dev/null | grep -c "vlan id 20")
@@ -235,7 +235,7 @@ test_rateexceed_linux() {
     local iface; iface=$(slot_iface linux 1)
     fw_enable vm ACCEPT ACCEPT
     fw_rule vm DROP out --iface "$iface" \
-        --comment "@neo:notrack @neo:rateexceed 50"
+        --comment "@neo:stateless @neo:rateexceed 50"
     fw_apply
     local got
     got=$(nft list ruleset 2>/dev/null | grep -c "limit rate over 50")
@@ -353,9 +353,9 @@ test_notrack_srcmac_linux() {
 
     fw_enable vm ACCEPT ACCEPT
     # pvesh prepends: create bottom-up so final order is ACCEPT (pos 0) then DROP.
-    fw_rule vm DROP out --iface "$iface" --comment "@neo:notrack"
+    fw_rule vm DROP out --iface "$iface" --comment "@neo:stateless"
     fw_rule vm ACCEPT out --iface "$iface" \
-        --comment "@neo:notrack @neo:srcmac exact $vm_mac"
+        --comment "@neo:stateless @neo:srcmac exact $vm_mac"
     fw_apply
     check "notrack+srcmac exact: matching MAC passes" "PASS" "$(probe_ping linux 1)"
 }

@@ -156,7 +156,7 @@ class Compiler:
             elif not rule.enable:
                 # Disabled rule with no @neo: meaning — honor PVE's intent and skip.
                 continue
-            elif rule.is_notrack():
+            elif rule.is_stateless():
                 self._expand_notrack(vmid, config, nets, is_ct, rule)
             else:
                 self._expand_stateful(vmid, config, nets, is_ct, rule)
@@ -525,26 +525,34 @@ class Compiler:
         return None
 
     @staticmethod
-    def _apply_ct_decorator(match, rule):
+    def _apply_ct_decorator(match, rule, *, default_state=None):
         """Apply @neo:ct <state> decorator to match dict.
 
-        Only `new` and `invalid` are supported. `established` and `related`
-        are always globally accepted by the framework (nft forward chain /
-        OVS table 31) before per-port rules evaluate — a per-port rule
-        would never fire for those states.
+        Supported states: `new`, `invalid`. `established`/`related` are
+        always globally accepted by the framework before per-port rules
+        evaluate — a per-port rule would never fire for those states.
+
+        Bare `@neo:ct` (no args) = match all reachable states (new+invalid).
+        No ct_state key is set in the match — equivalent to no filter.
+
+        Stateful rules without explicit `@neo:ct` are semantically equivalent
+        to bare `@neo:ct` (match all). The compiler does NOT inject a default
+        ct_state to keep IR honest about what the rule actually matches.
         """
         ct_tag = rule.get_neo_tag("ct")
         if ct_tag and ct_tag.args:
             state = ct_tag.args[0].lower()
             if state in ("new", "invalid"):
                 match.setdefault("l3", {})["ct_state"] = state
+        elif default_state:
+            match.setdefault("l3", {})["ct_state"] = default_state
 
     def _build_notrack_rules(self, vmid, config, devname, rule):
         """Build IR rules for a @neo:notrack rule."""
         base_match = {"l2": {}, "l3": {}, "l4": {}}
 
         self._apply_l2_primitives(base_match, rule)
-        self._apply_ct_decorator(base_match, rule)
+        self._apply_ct_decorator(base_match, rule, default_state=None)
 
         # Source/dest (sets ether_type)
         self._apply_src_dst(base_match, rule, config)
@@ -675,7 +683,7 @@ class Compiler:
                 continue
             if not grule.enable:
                 continue
-            if grule.is_notrack():
+            if grule.is_stateless():
                 self._expand_notrack(vmid, config, nets, is_ct, grule)
             else:
                 self._expand_stateful(vmid, config, nets, is_ct, grule)

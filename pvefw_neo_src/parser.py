@@ -50,8 +50,12 @@ class FwRule:
         return self.enable
 
     def is_notrack(self):
-        """Check if this rule has @neo:notrack tag."""
+        """Check if this rule has @neo:notrack tag (legacy)."""
         return any(t.name == "notrack" for t in self.neo_tags)
+
+    def is_stateless(self):
+        """Check if this rule is stateless (@neo:stateless, @neo:noct, @neo:notrack)."""
+        return any(t.name in ("stateless", "noct", "notrack") for t in self.neo_tags)
 
     def get_neo_tag(self, name):
         """Get a specific @neo: tag by name, or None."""
