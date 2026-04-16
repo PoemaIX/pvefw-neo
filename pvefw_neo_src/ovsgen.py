@@ -286,18 +286,25 @@ class OvsRenderer:
         # ── L4 proto + ports ──
         proto = l3.get("proto")
         if proto:
+            # All protocols from PVE WebUI dropdown (pvemanagerlib.js)
+            # plus `icmpv6` alias used internally by PVE macros.
             proto_num = {
-                "tcp": 6, "udp": 17, "udplite": 136,
-                "icmp": 1, "icmpv6": 58, "ipv6-icmp": 58,
-                "gre": 47, "esp": 50, "ah": 51,
-                "sctp": 132, "dccp": 33,
-                "igmp": 2, "ipv6": 41,
-                "ipencap": 4, "ipip": 94,
-                "ospf": 89, "pim": 103, "vrrp": 112,
-                "l2tp": 115, "isis": 124,
-                "ipv6-route": 43, "ipv6-frag": 44,
-                "ipv6-nonxt": 59, "ipv6-opts": 60,
-                "rsvp": 46, "eigrp": 88,
+                "tcp": 6, "udp": 17, "icmp": 1, "igmp": 2,
+                "ggp": 3, "ipencap": 4, "st": 5, "egp": 8,
+                "igp": 9, "pup": 12, "hmp": 20, "xns-idp": 22,
+                "rdp": 27, "iso-tp4": 29, "dccp": 33, "xtp": 36,
+                "ddp": 37, "idpr-cmtp": 38, "ipv6": 41,
+                "ipv6-route": 43, "ipv6-frag": 44, "idrp": 45,
+                "rsvp": 46, "gre": 47, "esp": 50, "ah": 51,
+                "skip": 57, "ipv6-icmp": 58, "icmpv6": 58,
+                "ipv6-nonxt": 59, "ipv6-opts": 60, "vmtp": 81,
+                "eigrp": 88, "ospf": 89, "ax.25": 93, "ipip": 94,
+                "etherip": 97, "encap": 98, "pim": 103,
+                "ipcomp": 108, "vrrp": 112, "l2tp": 115,
+                "isis": 124, "sctp": 132, "fc": 133,
+                "mobility-header": 135, "udplite": 136,
+                "mpls-in-ip": 137, "hip": 139, "shim6": 140,
+                "wesp": 141, "rohc": 142,
             }.get(proto.lower())
             if proto_num is not None:
                 parts.append(f"nw_proto={proto_num}")
