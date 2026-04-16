@@ -276,6 +276,13 @@ class OvsRenderer:
         # Sets are NOT expanded here — caller must expand into N flows
         # (we leave src_set/dst_set marker for caller to detect)
 
+        # ── ct_state ──
+        ct_state_map = {"new": "+new", "invalid": "+inv"}
+        if "ct_state" in l3:
+            flag = ct_state_map.get(l3["ct_state"])
+            if flag:
+                parts.append(f"ct_state={flag}")
+
         # ── L4 proto + ports ──
         proto = l3.get("proto")
         if proto:
@@ -452,23 +459,6 @@ class OvsRenderer:
         # Related → NORMAL
         self.flows.append(self._emit(
             TBL_FWD_IN, 28500, ["ct_state=+rel-inv"], "NORMAL"))
-        # Per-port ct invalid drop (only ports with @neo:ctinvalid).
-        # Without opt-in, invalid packets fall through to per-port rules
-        # or NORMAL catchall — allowing asymmetric-routing traffic to pass.
-        for devname in sorted(stateful_devs):
-            nd = self.rs.netdevs.get(devname)
-            if not nd or not nd.ctinvalid:
-                continue
-            ofport = self.port_map.get(devname)
-            mac = dev_mac.get(devname)
-            if ofport:
-                self.flows.append(self._emit(
-                    TBL_FWD_IN, 28000,
-                    [f"in_port={ofport}", "ct_state=+inv"], "drop"))
-            if mac:
-                self.flows.append(self._emit(
-                    TBL_FWD_IN, 28000,
-                    [f"dl_dst={mac}", "ct_state=+inv"], "drop"))
         # Default → NORMAL (no rules = pass)
         self.flows.append(self._emit(
             TBL_FWD_IN, 0, [], "NORMAL"))

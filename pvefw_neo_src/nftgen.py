@@ -195,6 +195,9 @@ class NftRenderer:
                 if ns and ns.excludes:
                     parts.append(f"{daddr_field} != @{sname}_nomatch")
 
+        if "ct_state" in l3:
+            parts.append(f"ct state {l3['ct_state']}")
+
         if "proto" in l3:
             proto = self._proto_to_nft(l3["proto"])
             parts.append(f"meta l4proto {proto}")
@@ -404,6 +407,17 @@ class NftRenderer:
         )
         # Skip rules entirely if no NetDev has STATEFUL rules
         if self._stateful_devs:
+            # Ports with ONLY stateless rules (sugar tags) don't need ct.
+            # Early-accept them before the ct framework so their traffic
+            # never triggers a conntrack lookup.
+            all_managed = {dn for dn in self.rs.netdevs
+                           if dn in self.devnames
+                           and not self.rs.netdevs[dn].disabled}
+            non_stateful = sorted(all_managed - self._stateful_devs)
+            for dn in non_stateful:
+                lines.append(f'        iifname "{dn}" accept')
+                lines.append(f'        oifname "{dn}" accept')
+
             # ARP pass-through (so MAC learning works)
             lines.append("        ether type arp accept")
             # Conntrack framework
@@ -434,9 +448,6 @@ class NftRenderer:
                          else f"vm_{devname}_in")
             lines.append("")
             lines.append(f"    chain {chain_name} {{")
-            nd = self.rs.netdevs.get(devname)
-            if nd and nd.ctinvalid:
-                lines.append("        ct state invalid drop")
             for rl in self._fwd_chains[(devname, direction)]:
                 lines.append(f"        {rl}")
             lines.append("    }")

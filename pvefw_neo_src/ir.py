@@ -65,6 +65,7 @@ class Direction(Enum):
 #   dst_ip:         str           compiler 同步設 l2.ether_type
 #   src_set:        str           NamedSet 名稱
 #   dst_set:        str
+#   ct_state:       str           "new" / "invalid" / "established" / "related"
 #   proto:          str           "tcp" / "udp" / "icmp" / "icmpv6" / "47"
 #   icmp_type:      list[str]     ["echo-request", "echo-reply"]   (v4)
 #   icmpv6_type:    list[str]     ["nd-router-advert"]              (v6)
@@ -108,7 +109,6 @@ class NetDev:
     isolated: bool = False     # Linux bridge isolated flag (語意 A)
                                #   nft: bridge link set isolated on
                                #   ovs: reg0 mark + dl_dst drop
-    ctinvalid: bool = False    # @neo:ctinvalid — drop ct_state invalid on this port
     disabled: bool = False     # @neo:disable — debug switch, 跳過整個 port
                                # backends 看到 disabled=True 就完全 skip,
                                # 封包透通（跟 port 沒出現在 IR 等價）

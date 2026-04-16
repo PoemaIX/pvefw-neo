@@ -434,11 +434,16 @@ class Compiler:
                 nd.isolated = True
 
     def _sugar_ctinvalid(self, vmid, config, nets, is_ct, rule, tag):
-        """@neo:ctinvalid → set NetDev.ctinvalid (drop ct invalid on port)."""
+        """@neo:ctinvalid → expands to IN DROP + OUT DROP with ct_state=invalid."""
         for iface, devname in self._get_iface_devnames(vmid, rule, nets, is_ct):
-            nd = self.netdevs.get(devname)
-            if nd:
-                nd.ctinvalid = True
+            for direction in (ir.Direction.IN, ir.Direction.OUT):
+                self._add_rule(devname, ir.Rule(
+                    direction=direction,
+                    phase=ir.Phase.STATEFUL,
+                    match={"l3": {"ct_state": "invalid"}},
+                    action="drop",
+                    comment="@neo:ctinvalid",
+                ))
 
     def _sugar_disable(self, vmid, config, nets, is_ct, rule, tag):
         """@neo:disable → set NetDev.disabled (debug: bypass this port).
@@ -519,11 +524,27 @@ class Compiler:
                 return None
         return None
 
+    @staticmethod
+    def _apply_ct_decorator(match, rule):
+        """Apply @neo:ct <state> decorator to match dict.
+
+        Only `new` and `invalid` are supported. `established` and `related`
+        are always globally accepted by the framework (nft forward chain /
+        OVS table 31) before per-port rules evaluate — a per-port rule
+        would never fire for those states.
+        """
+        ct_tag = rule.get_neo_tag("ct")
+        if ct_tag and ct_tag.args:
+            state = ct_tag.args[0].lower()
+            if state in ("new", "invalid"):
+                match.setdefault("l3", {})["ct_state"] = state
+
     def _build_notrack_rules(self, vmid, config, devname, rule):
         """Build IR rules for a @neo:notrack rule."""
         base_match = {"l2": {}, "l3": {}, "l4": {}}
 
         self._apply_l2_primitives(base_match, rule)
+        self._apply_ct_decorator(base_match, rule)
 
         # Source/dest (sets ether_type)
         self._apply_src_dst(base_match, rule, config)
@@ -588,6 +609,7 @@ class Compiler:
                 return []
             base_match = {"l2": {}, "l3": {}, "l4": {}}
             self._apply_l2_primitives(base_match, rule)
+            self._apply_ct_decorator(base_match, rule)
             self._apply_src_dst(base_match, rule, config)
             return self._expand_macro_rules(base_match, rule, action,
                                            direction, ir.Phase.STATEFUL,
@@ -596,6 +618,7 @@ class Compiler:
         # No macro: build single rule
         match = {"l2": {}, "l3": {}, "l4": {}}
         self._apply_l2_primitives(match, rule)
+        self._apply_ct_decorator(match, rule)
         self._apply_src_dst(match, rule, config)
         if rule.proto:
             match["l3"]["proto"] = rule.proto.lower()
