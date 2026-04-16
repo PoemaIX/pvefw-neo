@@ -1,7 +1,7 @@
 # pvefw-neo
 
 A drop-in nftables/OVS firewall manager for Proxmox VE. Per-port
-macspoof/ipspoof, NOTRACK bypass for asymmetric routing, OVS bridge
+macspoof/ipspoof, stateless bypass for asymmetric routing, OVS bridge
 support, multi-backend (native nftables for Linux bridge, OpenFlow for
 OVS), reuses the existing PVE `.fw` config files.
 
@@ -94,6 +94,7 @@ extension rule:
 | `@neo:nora` | Drop outbound IPv6 Router Advertisement. |
 | `@neo:nondp` | Drop outbound IPv6 NS/NA (block spoofed NDP). |
 | `@neo:mcast_limit <pps>` | Rate-limit multicast frames at netdev ingress. |
+| `@neo:ctinvalid` | Drop `ct_state=invalid` packets on this port (both IN + OUT). Without this, invalid packets (e.g. asymmetric routing returns) are accepted by matching rules — same as PVE's `nf_conntrack_allow_invalid=1`. |
 
 **Examples** (each row shows the non-shared fields; the other WebUI
 fields follow the skeleton above):
@@ -133,11 +134,14 @@ fields follow the skeleton above):
 Decorators extend **real** (non-Finger) PVE rules. They either change
 rule behavior or add extra match conditions.
 
-#### Behavior-changing
+#### Rule evaluation mode
 
 | Tag | Effect |
 |---|---|
-| `@neo:notrack` | Evaluate this rule stateless. Lives in `bridge raw_prerouting` (nft) or table 10 (OVS), bypasses conntrack entirely. Order matters — more specific first, catch-all last. |
+| `@neo:stateless` | Evaluate this rule **before conntrack**, purely per-packet. Lives in `bridge raw_prerouting` (nft) or table 10 (OVS). No ct state concept — just match packet fields. Order matters: more specific first, catch-all last. Aliases: `@neo:noct`, `@neo:notrack`. |
+| `@neo:ct new` | Stateful rule, but only match `ct_state=new` connections. Packets with `ct_state=invalid` (e.g. asymmetric routing returns) are NOT matched and fall through to the next rule. |
+| `@neo:ct invalid` | Stateful rule, only match `ct_state=invalid` packets. Use with `DROP` to explicitly reject invalid traffic on a per-rule basis (more granular than `@neo:ctinvalid` sugar which drops all invalid on the port). |
+| *(not written)* | Default: stateful rule matching **all** reachable ct states (`new` + `invalid`). `established`/`related` are always accepted globally before per-port rules and never reach your rules. |
 
 #### Extra-match (narrows the rule's scope)
 
@@ -148,7 +152,7 @@ rule behavior or add extra match conditions.
 | `@neo:dstmac exact <mac>` | Only match packets whose destination MAC equals `<mac>`. |
 | `@neo:dstmac bitmask <mac>` | Match destination MAC by bitmask. |
 | `@neo:vlan <vid\|untagged\|vid1,vid2>` | Only match traffic on the given VLAN(s). Used when a trunk port is handed to the VM and you want a rule scoped to one inner VLAN. |
-| `@neo:rateexceed <pps>` | Only match the portion of traffic that **exceeds** `<pps>`. Packets within the rate budget fall through to the next rule. **`@neo:notrack` only** — not supported on stateful rules. |
+| `@neo:rateexceed <pps>` | Only match the portion of traffic that **exceeds** `<pps>`. Packets within the rate budget fall through to the next rule. **`@neo:stateless` only** — not supported on stateful rules. |
 
 **Examples** — decorators attach to real PVE rules. Unlike extension
 rules these use **real** macros/actions and are **enabled** in the
@@ -158,37 +162,51 @@ WebUI (no `|` prefix; Enable **checked**):
 
 | Direction | Action | Macro | Source | Comment |
 |---|---|---|---|---|
-| `out` | `ACCEPT` | *(none)* | `10.0.0.10/32` | `@neo:notrack @neo:srcmac exact aa:bb:cc:dd:ee:ff` |
-| `out` | `DROP`   | *(none)* | *(none)*        | `@neo:notrack` |
+| `out` | `ACCEPT` | *(none)* | `10.0.0.10/32` | `@neo:stateless @neo:srcmac exact aa:bb:cc:dd:ee:ff` |
+| `out` | `DROP`   | *(none)* | *(none)*        | `@neo:stateless` |
 
 **VLAN-scoped** stateless rule (trunk port, inner VLAN 20 only):
 
 | Direction | Action | Macro | Source | Comment |
 |---|---|---|---|---|
-| `out` | `ACCEPT` | *(none)* | `10.0.0.0/24` | `@neo:notrack @neo:vlan 20` |
+| `out` | `ACCEPT` | *(none)* | `10.0.0.0/24` | `@neo:stateless @neo:vlan 20` |
+
+**Drop ct invalid** on specific port + direction (stateful):
+
+| Direction | Action | Macro | Source | Comment |
+|---|---|---|---|---|
+| `in`  | `DROP` | *(none)* | *(none)* | `@neo:ct invalid` |
+| `out` | `DROP` | *(none)* | *(none)* | `@neo:ct invalid` |
+
+**Accept only new connections** (reject asymmetric/invalid returns):
+
+| Direction | Action | Macro | Source | Comment |
+|---|---|---|---|---|
+| `in`  | `ACCEPT` | `SSH` | *(none)* | `@neo:ct new` |
 
 ### Why sugar = decorators
 
-`macspoof`, `ipspoof`, `nodhcp`, `nora`, `nondp`, `mcast_limit` are all
-**sugar** over decorator rules. Conceptually each sugar tag expands
-into one or more decorator-based rules at compile time:
+`macspoof`, `ipspoof`, `nodhcp`, `nora`, `nondp`, `mcast_limit`,
+`ctinvalid` are all **sugar** over decorator rules. Each sugar tag
+expands into one or more decorator-based rules at compile time:
 
 ```
-# @neo:macspoof mac1,mac2   expands to:
-OUT @neo:notrack @neo:srcmac exact mac1 allow
-OUT @neo:notrack @neo:srcmac exact mac2 allow
-OUT @neo:notrack                        drop
+# @neo:macspoof mac1,mac2
+→ single stateless rule: drop if src_mac ∉ {mac1, mac2}
 
-# @neo:ipspoof ip1,cidr2    expands to:
-OUT ACCEPT -source ip1/32  # @neo:notrack
-OUT ACCEPT -source cidr2   # @neo:notrack
-OUT DROP                   # @neo:notrack
+# @neo:ipspoof ip1,cidr2
+→ 3 stateless rules (ARP/IPv4/IPv6): drop if src_ip ∉ allow-list
+  (uses pure-nomatch ipset internally)
 
-# @neo:mcast_limit 100      expands to (roughly):
-OUT DROP # @neo:notrack @neo:rateexceed 100 @neo:dstmac bitmask 01:00:00:00:00:00
+# @neo:mcast_limit 100
+→ single stateless rule: drop multicast exceeding 100 pps
+
+# @neo:ctinvalid
+→ IN DROP # @neo:ct invalid
+  OUT DROP # @neo:ct invalid
 ```
 
-So the compile pipeline is:
+Compile pipeline:
 
 1. Sugar expansion (after this, only `@neo:disable` / `@neo:isolated`
    remain as extension rules; everything else is a normal rule +
@@ -222,7 +240,7 @@ pvefw-neo --preflight-check   # verify host.fw enable=0 + nftables=1
 | `REJECT` becomes `DROP` | neither `bridge` family nor OVS supports REJECT. Peer times out. |
 | `Finger` macro is reserved as the sugar carrier | TCP/79 is unused in practice. |
 | OVS isolation needs ≥2 isolated ports to take effect | "Two isolated ports cannot communicate" — a single isolated port is meaningless. |
-| `@neo:rateexceed` only on `@neo:notrack` | Rate-after-conntrack has edge cases the OVS meter path can't express cleanly. |
+| `@neo:rateexceed` only on `@neo:stateless` | Rate-after-conntrack has edge cases the OVS meter path can't express cleanly. |
 | OVS backend expands ipsets by CIDR pre-subtraction | Flow count grows with ipset size. Small sets are fine, huge ones may be slow to compile. |
 | `@neo:` tags live in rule comments | PVE WebUI's comment field has a length limit — split complex rules across multiple lines. |
 

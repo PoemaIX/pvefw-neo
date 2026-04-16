@@ -1,7 +1,7 @@
 # pvefw-neo
 
 為 Proxmox VE 設計的 nftables / OVS 防火牆管理器。支援 per-port
-macspoof / ipspoof、NOTRACK 旁路（解決非對稱路由）、OVS bridge、多後端
+macspoof / ipspoof、stateless 旁路（解決非對稱路由）、OVS bridge、多後端
 （Linux bridge 走 nftables，OVS 走 OpenFlow），直接讀取既有的 PVE
 `.fw` 設定檔。
 
@@ -88,6 +88,7 @@ comment 欄位裡。
 | `@neo:nora` | 阻止外送 IPv6 Router Advertisement。 |
 | `@neo:nondp` | 阻止外送 IPv6 NS/NA（防偽造 NDP）。 |
 | `@neo:mcast_limit <pps>` | 對 netdev ingress 的 multicast 封包做 rate limit。 |
+| `@neo:ctinvalid` | 在此 port 上丟棄 `ct_state=invalid` 封包（IN + OUT 都擋）。未設時 invalid 封包（如非對稱路由 return traffic）會被正常規則接受，等同 PVE 的 `nf_conntrack_allow_invalid=1`。 |
 
 **範例**（每條規則只列出需要填的欄位，其他欄位照上面的骨架）：
 
@@ -126,11 +127,14 @@ comment 欄位裡。
 Decorator 附加在**真正的** (非 Finger) PVE 規則上。有的改變規則行
 為，有的限縮匹配範圍。
 
-#### 行為改變類
+#### 規則評估模式
 
 | Tag | 效果 |
 |---|---|
-| `@neo:notrack` | 此規則走 stateless：放進 `bridge raw_prerouting` (nft) 或 table 10 (OVS)，完全繞過 conntrack。順序很重要 — 具體的先寫，catch-all 最後。 |
+| `@neo:stateless` | 在 **conntrack 之前**評估，純 per-packet 匹配。放在 `bridge raw_prerouting` (nft) 或 table 10 (OVS)。沒有 ct state 概念。順序很重要 — 具體的先寫，catch-all 最後。別名：`@neo:noct`、`@neo:notrack`。 |
+| `@neo:ct new` | Stateful 規則，但只匹配 `ct_state=new` 的封包。`invalid` 封包（如非對稱路由 return traffic）不匹配，落到下一條規則。 |
+| `@neo:ct invalid` | Stateful 規則，只匹配 `ct_state=invalid` 的封包。搭配 `DROP` 可 per-rule 精細控制（比 `@neo:ctinvalid` sugar 更靈活，可搭配 `@neo:vlan` 等）。 |
+| *(不寫)* | 預設：stateful 規則匹配**所有**到達 per-port chain 的封包（`new` + `invalid`）。`established`/`related` 已被 global accept 攔走，永遠不會到達你的規則。 |
 
 #### 額外匹配類（限縮範圍）
 
@@ -141,7 +145,7 @@ Decorator 附加在**真正的** (非 Finger) PVE 規則上。有的改變規則
 | `@neo:dstmac exact <mac>` | 只套用到 dst MAC 等於 `<mac>` 的封包。 |
 | `@neo:dstmac bitmask <mac>` | bitmask 匹配 dst MAC。 |
 | `@neo:vlan <vid\|untagged\|vid1,vid2>` | 只套用到指定 VLAN 的流量。用於 trunk port 給 VM 時，規則只作用在內層某 VLAN。 |
-| `@neo:rateexceed <pps>` | 只匹配規則條件中**超過** `<pps>` 的部分；rate 內的封包落到下一條規則。**僅限 `@neo:notrack`**，stateful 規則不支援。 |
+| `@neo:rateexceed <pps>` | 只匹配規則條件中**超過** `<pps>` 的部分；rate 內的封包落到下一條規則。**僅限 `@neo:stateless`**，stateful 規則不支援。 |
 
 **範例** — decorator 附加在**真實**的 PVE 規則上：用真的 macro / action，
 WebUI 中要**打勾 enable**（不是 `|` disabled）：
@@ -150,33 +154,47 @@ WebUI 中要**打勾 enable**（不是 `|` disabled）：
 
 | Direction | Action | Macro | Source | Comment |
 |---|---|---|---|---|
-| `out` | `ACCEPT` | *(無)* | `10.0.0.10/32` | `@neo:notrack @neo:srcmac exact aa:bb:cc:dd:ee:ff` |
-| `out` | `DROP`   | *(無)* | *(無)*          | `@neo:notrack` |
+| `out` | `ACCEPT` | *(無)* | `10.0.0.10/32` | `@neo:stateless @neo:srcmac exact aa:bb:cc:dd:ee:ff` |
+| `out` | `DROP`   | *(無)* | *(無)*          | `@neo:stateless` |
 
 **VLAN-scoped** stateless 規則（trunk port，只套用在內層 VLAN 20）：
 
 | Direction | Action | Macro | Source | Comment |
 |---|---|---|---|---|
-| `out` | `ACCEPT` | *(無)* | `10.0.0.0/24` | `@neo:notrack @neo:vlan 20` |
+| `out` | `ACCEPT` | *(無)* | `10.0.0.0/24` | `@neo:stateless @neo:vlan 20` |
+
+**丟棄 ct invalid**（per-port，stateful）：
+
+| Direction | Action | Macro | Source | Comment |
+|---|---|---|---|---|
+| `in`  | `DROP` | *(無)* | *(無)* | `@neo:ct invalid` |
+| `out` | `DROP` | *(無)* | *(無)* | `@neo:ct invalid` |
+
+**只接受 new 連線**（拒絕 invalid return traffic）：
+
+| Direction | Action | Macro | Source | Comment |
+|---|---|---|---|---|
+| `in`  | `ACCEPT` | `SSH` | *(無)* | `@neo:ct new` |
 
 ### 語法糖 = decorator 組合
 
-`macspoof`、`ipspoof`、`nodhcp`、`nora`、`nondp`、`mcast_limit` 實
-際上都是 decorator 組合的**語法糖**。編譯期會展開：
+`macspoof`、`ipspoof`、`nodhcp`、`nora`、`nondp`、`mcast_limit`、
+`ctinvalid` 實際上都是 decorator 組合的**語法糖**。編譯期會展開：
 
 ```
-# @neo:macspoof mac1,mac2   展開成：
-OUT @neo:notrack @neo:srcmac exact mac1 allow
-OUT @neo:notrack @neo:srcmac exact mac2 allow
-OUT @neo:notrack                        drop
+# @neo:macspoof mac1,mac2
+→ 單一 stateless 規則：src_mac ∉ {mac1, mac2} 就 drop
 
-# @neo:ipspoof ip1,cidr2    展開成：
-OUT ACCEPT -source ip1/32  # @neo:notrack
-OUT ACCEPT -source cidr2   # @neo:notrack
-OUT DROP                   # @neo:notrack
+# @neo:ipspoof ip1,cidr2
+→ 3 條 stateless 規則 (ARP/IPv4/IPv6)：src_ip ∉ 允許清單就 drop
+  （內部使用 pure-nomatch ipset）
 
-# @neo:mcast_limit 100      展開成（大致）：
-OUT DROP # @neo:notrack @neo:rateexceed 100 @neo:dstmac bitmask 01:00:00:00:00:00
+# @neo:mcast_limit 100
+→ 單一 stateless 規則：multicast 超過 100 pps 就 drop
+
+# @neo:ctinvalid
+→ IN DROP # @neo:ct invalid
+  OUT DROP # @neo:ct invalid
 ```
 
 所以編譯流程是：
@@ -211,7 +229,7 @@ pvefw-neo --preflight-check   # 檢查 host.fw enable=0 + nftables=1
 | `REJECT` 變成 `DROP` | `bridge` family 和 OVS 都不支援 REJECT，對端只會 timeout。 |
 | `Finger` macro 保留作為語法糖載體 | TCP/79 實際沒人用。 |
 | OVS isolation 需要 ≥2 個 isolated port 才生效 | 「兩個 isolated port 互相不通」— 只有一個 isolated port 沒意義。 |
-| `@neo:rateexceed` 只支援 `@neo:notrack` | stateful + rate limit 的語意在 OVS meter 模型下無法乾淨表達。 |
+| `@neo:rateexceed` 只支援 `@neo:stateless` | stateful + rate limit 的語意在 OVS meter 模型下無法乾淨表達。 |
 | OVS 後端以 CIDR 預先相減展開 ipset | 流量表大小隨 ipset 成員數成長；小集合沒問題，大集合編譯會慢。 |
 | `@neo:` 標籤寫在 comment 欄位 | PVE WebUI 的 comment 欄有長度限制，複雜規則要拆多行。 |
 
