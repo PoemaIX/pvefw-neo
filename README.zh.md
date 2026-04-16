@@ -93,7 +93,7 @@ daemon 會在數秒內偵測變動並重新套用。
 
 這類規則是 PVE native firewall 沒提供的功能  
 因為 PVE WebUI 沒有對應欄位，我們無法直接編輯  
-所以我們借用幾十年前已經沒人用的 **Finger** 協定（TCP/79）作為載體(並標記為 **disabled**（PVE 會忽略)，把真正的規則寫在 comment 欄位  
+所以我們借用幾十年前已經沒人用的 **Finger** 協定（TCP/79）作為載體(並標記為 **disabled**)，把真正的規則寫在 comment 欄位  
 
 **WebUI 操作步驟**（`VM → Firewall → Add`)
 
