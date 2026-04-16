@@ -258,8 +258,9 @@ class Compiler:
                 handler(vmid, config, nets, is_ct, rule, tag)
 
     def _sugar_macspoof(self, vmid, config, nets, is_ct, rule, tag):
-        """@neo:macspoof [mac1,mac2,...] → STATELESS rule: drop if src MAC
-        not in the whitelist. Empty args = auto-read from VM config."""
+        """@neo:macspoof [mac1,mac2,...] → expands to:
+           OUT DROP # @neo:stateless @neo:srcmac exact not mac1,mac2
+        Empty args = auto-read from VM config. Sugar disappears in IR."""
         for iface, devname in self._get_iface_devnames(vmid, rule, nets, is_ct):
             if tag.args:
                 macs = [m.strip().upper() for m in tag.args[0].split(",")
@@ -275,7 +276,7 @@ class Compiler:
                 phase=ir.Phase.STATELESS,
                 match={"l2": {"src_mac_neg": neg}},
                 action="drop",
-                comment=f"@neo:macspoof {','.join(macs)}",
+                comment=f"@neo:stateless @neo:srcmac notin {','.join(macs)}",
             ))
 
     def _sugar_ipspoof(self, vmid, config, nets, is_ct, rule, tag):
@@ -486,24 +487,31 @@ class Compiler:
           @neo:dstmac bitmask <mac>      ether daddr & mac == mac
         A bare `@neo:srcmac <mac>` (no mode) defaults to `exact`.
         """
-        for tag_name, exact_key, mask_key in (
-            ("srcmac", "src_mac", "src_mac_mask"),
-            ("dstmac", "dst_mac", "dst_mac_mask"),
+        for tag_name, pos_key, neg_key, mask_key in (
+            ("srcmac", "src_mac", "src_mac_neg", "src_mac_mask"),
+            ("dstmac", "dst_mac", "dst_mac_neg", "dst_mac_mask"),
         ):
             tag = rule.get_neo_tag(tag_name)
             if not tag or not tag.args:
                 continue
-            if len(tag.args) >= 2 and tag.args[0].lower() in ("exact", "bitmask"):
-                mode = tag.args[0].lower()
-                mac = tag.args[1]
+            # Syntax: @neo:srcmac <mode> <mac[,mac2,...]>
+            #   mode: in | notin | exact (alias for in) | bitmask
+            args = list(tag.args)
+            if args[0].lower() in ("in", "notin", "exact", "bitmask"):
+                mode = args.pop(0).lower()
             else:
-                mode = "exact"
-                mac = tag.args[0]
-            mac = mac.upper()
+                mode = "in"
+            if not args:
+                continue
+            raw_val = args[0]
             if mode == "bitmask":
+                mac = raw_val.upper()
                 match["l2"][mask_key] = (mac, mac)
-            else:
-                match["l2"][exact_key] = mac
+            elif mode == "notin":
+                macs = [m.strip().upper() for m in raw_val.split(",") if m.strip()]
+                match["l2"][neg_key] = macs[0] if len(macs) == 1 else macs
+            else:  # in / exact
+                match["l2"][pos_key] = raw_val.upper()
 
         vlan_tag = rule.get_neo_tag("vlan")
         if vlan_tag and vlan_tag.args:
