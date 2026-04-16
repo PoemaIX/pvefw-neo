@@ -5,7 +5,7 @@ macspoof/ipspoof, stateless bypass for asymmetric routing, OVS bridge
 support, multi-backend (native nftables for Linux bridge, OpenFlow for
 OVS), reuses the existing PVE `.fw` config files.
 
-> 🌐 [繁體中文版](README.zh_TW.md)
+> 🌐 [中文](README.zh.md)
 > 🏗️ Architecture & internals: [DESIGN.md](DESIGN.md)
 
 ---
