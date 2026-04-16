@@ -112,46 +112,8 @@ daemon 會在數秒內偵測變動並重新套用。
 |---|---|
 | `@neo:disable` | 關閉 pvefw-neo 對此 port 的管理，該 port 上其他規則全部忽略，流量直接放行。<br>等同 PVE 的 "port-level firewall disable"(之所以不能用 PVE GUI 那個旗標：打勾之後 PVE 會建立 fwbr，我們不能接受) |
 | `@neo:isolated` | 設定 kernel bridge `isolated on`（Linux）或對應的 OF 規則（OVS）。<br>同 bridge 上兩個 isolated port 互相不通；isolated ↔ 非 isolated 可通 |
-| `@neo:macspoof [macs]` | 只允許列表中的 source MAC 通過，其餘 drop。沒給參數 = 自動從 VM config 讀。 |
-| `@neo:ipspoof` | 只允許列出的 source IP 通過（把 IP 清單填在 **Source** 欄位）。自動處理 ARP / IPv4 / IPv6（含 DAD、link-local、白名單）。 |
-| `@neo:nodhcp` | 阻止 VM 當 DHCP server（drop UDP sport 67/547 → dport 68/546）。 |
-| `@neo:nora` | 阻止外送 IPv6 Router Advertisement。 |
-| `@neo:nondp` | 阻止外送 IPv6 NS/NA（防偽造 NDP）。 |
-| `@neo:mcast_limit <pps>` | 對 netdev ingress 的 multicast 封包做 rate limit。 |
-| `@neo:ct invalid` | 在此 port 上丟棄 `ct_state=invalid` 封包（IN + OUT 都擋）。未設時 invalid 封包（如非對稱路由 return traffic）會被正常規則接受，等同 PVE 的 `nf_conntrack_allow_invalid=0`。 |
 
-**範例**（每條規則只列出需要填的欄位，其他欄位照上面的骨架）：
-
-**ipspoof** — 只允許部分 source IP：
-
-| 欄位 | 值 |
-|---|---|
-| Source | `192.168.5.6,192.168.5.7,192.168.20.0/24` |
-| Comment | `@neo:ipspoof` |
-
-**macspoof** — 只允許部分 source MAC：
-
-| 欄位 | 值 |
-|---|---|
-| Comment | `@neo:macspoof 22:44:66:88:aa:bb,22:44:66:88:aa:cc` |
-
-**macspoof** — 自動從 VM config 讀取 MAC（不給參數）：
-
-| 欄位 | 值 |
-|---|---|
-| Comment | `@neo:macspoof` |
-
-**nodhcp** — 禁止此 VM 成為 DHCP server：
-
-| 欄位 | 值 |
-|---|---|
-| Comment | `@neo:nodhcp` |
-
-**mcast_limit** — multicast 限速 100 pps：
-
-| 欄位 | 值 |
-|---|---|
-| Comment | `@neo:mcast_limit 100` |
+其餘 Extension rules 都是**語法糖**（見下方「語法糖」章節）。
 
 ### 第二類 — Decorator tags
 
@@ -219,77 +181,133 @@ Decorator 附加在**真正的** (非 Finger) PVE 規則上。有的改變規則
 
 ### 語法糖
 
-Extension rules 中，有相當多的規則期實是語法糖，編譯期會展開：  
-`macspoof`、`ipspoof`、`nodhcp`、`nora`、`nondp`、`mcast_limit`
+以下 Extension rules 都是**語法糖** — 編譯期會展開成 decorator 規則組合，語法糖本身消失。
+使用方式和其他 Extension rules 相同（Finger 骨架 + comment）。
 
+---
 
+#### `@neo:macspoof [mac1,mac2,...]`
 
-語法糖
+只允許列表中的 source MAC 通過，其餘 drop。沒給參數 = 自動從 VM config 讀。
+
+| 欄位 | 值 |
+|---|---|
+| Comment | `@neo:macspoof` 或 `@neo:macspoof 22:44:66:88:aa:bb,22:44:66:88:aa:cc` |
+
+展開成:
+
+| Direction | Action | Comment |
+|---|---|---|
+| `out` | `DROP` | `@neo:noct @neo:srcmac notin <mac>`（MAC 自動從網卡讀取）|
+
+---
+
+#### `@neo:ipspoof`
+
+只允許列出的 source IP 通過。自動處理 ARP / IPv4 / IPv6（含 DAD、link-local）。
+IP 清單填在 **Source** 欄位。
+
+| 欄位 | 值 |
+|---|---|
+| Source | `192.168.16.3,192.168.30.0/24` |
+| Comment | `@neo:ipspoof` |
+
+展開成 pure-nomatch ipset + 3 條 stateless 規則（ARP / v4 / v6）:
 ```
-# @neo:macspoof
-```
-展開後:
-
-| Direction | Action | Macro | Source | Comment |
-|---|---|---|---|---|
-| `out` | `DROP` | *(無)* | *(無)* | `@neo:noct @neo:srcmac notin aa:bb:cc:dd:ee:ff`<br> mac自動從網卡上面抓 |
-
-語法糖
-```
-# @neo:ipspoof 192.168.16.3,192.168.30.0/24
-```
-展開後:
-```
-[IPSET vm100_ipspoof_1]
-
-!192.168.1.2
+[IPSET vm100_ipspoof_net0_v4]
+!192.168.16.3
 !192.168.30.0/24
 ```
 
-| Direction | Action | Macro | Source | Comment |
-|---|---|---|---|---|
-| `out` | `DROP` | *(無)* | `+guest/vm100_ipspoof_1` | `@neo:noct` |
-
-語法糖: 阻止 VM 當 DHCP server
-```
-# @neo:nodhcp
-```
-展開後（v4 + v6 各一條）:
-
 | Direction | Action | Source | Comment |
 |---|---|---|---|
-| `out` | `DROP` | *(無)* | `@neo:noct` + match `udp sport 67 dport 68` (v4) |
-| `out` | `DROP` | *(無)* | `@neo:noct` + match `udp sport 547 dport 546` (v6) |
+| `out` | `DROP` | `+guest/vm100_ipspoof_net0_v4` | `@neo:noct` |
 
-語法糖: 阻止 VM 發送 Router Advertisement
-```
-# @neo:nora
-```
-展開後:
+---
 
-| Direction | Action | Source | Comment |
-|---|---|---|---|
-| `out` | `DROP` | *(無)* | `@neo:noct` + match `icmpv6 type nd-router-advert` |
+#### `@neo:nodhcp`
 
-語法糖: 阻止 VM 發送 NDP (Neighbor Solicit / Advert)
-```
-# @neo:nondp
-```
-展開後:
+阻止 VM 當 DHCP server（drop UDP sport 67/547 → dport 68/546）。
 
-| Direction | Action | Source | Comment |
-|---|---|---|---|
-| `out` | `DROP` | *(無)* | `@neo:noct` + match `icmpv6 type {nd-neighbor-solicit, nd-neighbor-advert}` |
+| 欄位 | 值 |
+|---|---|
+| Comment | `@neo:nodhcp` |
 
-語法糖: 限制 multicast 封包最多 100 pps
-```
-# @neo:mcast_limit 100
-```
-展開後:
+展開成（v4 + v6 各一條）:
 
-| Direction | Action | Macro | Source | Comment |
-|---|---|---|---|---|
-| `out` | `DROP` | *(無)* | *(無)* | `@neo:noct @neo:rateexceed 100 @neo:dstmac bitmask 01:00:00:00:00:00` |
+| Direction | Action | Comment |
+|---|---|---|
+| `out` | `DROP` | `@neo:noct` + match `udp sport 67 dport 68` (v4) |
+| `out` | `DROP` | `@neo:noct` + match `udp sport 547 dport 546` (v6) |
+
+---
+
+#### `@neo:nora`
+
+阻止外送 IPv6 Router Advertisement。
+
+| 欄位 | 值 |
+|---|---|
+| Comment | `@neo:nora` |
+
+展開成:
+
+| Direction | Action | Comment |
+|---|---|---|
+| `out` | `DROP` | `@neo:noct` + match `icmpv6 type nd-router-advert` |
+
+---
+
+#### `@neo:nondp`
+
+阻止外送 IPv6 NS/NA（防偽造 NDP）。
+
+| 欄位 | 值 |
+|---|---|
+| Comment | `@neo:nondp` |
+
+展開成:
+
+| Direction | Action | Comment |
+|---|---|---|
+| `out` | `DROP` | `@neo:noct` + match `icmpv6 type {nd-neighbor-solicit, nd-neighbor-advert}` |
+
+---
+
+#### `@neo:mcast_limit <pps>`
+
+對 netdev ingress 的 multicast 封包做 rate limit。
+
+| 欄位 | 值 |
+|---|---|
+| Comment | `@neo:mcast_limit 100` |
+
+展開成:
+
+| Direction | Action | Comment |
+|---|---|---|
+| `out` | `DROP` | `@neo:noct @neo:rateexceed 100 @neo:dstmac bitmask 01:00:00:00:00:00` |
+
+---
+
+#### `@neo:ct invalid`（語法糖用法）
+
+在此 port 上丟棄 `ct_state=invalid` 封包（IN + OUT 都擋）。
+未設時 invalid 封包（如非對稱路由 return traffic）會被正常規則接受。
+
+| 欄位 | 值 |
+|---|---|
+| Comment | `@neo:ct invalid` |
+
+展開成:
+
+| Direction | Action | Comment |
+|---|---|---|
+| `in`  | `DROP` | `@neo:ct invalid` |
+| `out` | `DROP` | `@neo:ct invalid` |
+
+> 注意：`@neo:ct invalid` 也可以作為 **decorator** 直接附加在一般規則上（見 Decorator tags 章節），
+> 此時不需要 Finger 載體，而是更精細的 per-rule 控制。
 
 所以編譯流程是：
 
