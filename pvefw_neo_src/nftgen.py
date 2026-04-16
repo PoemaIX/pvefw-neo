@@ -408,7 +408,6 @@ class NftRenderer:
             lines.append("        ether type arp accept")
             # Conntrack framework
             lines.append("        ct state established,related accept")
-            lines.append("        ct state invalid drop")
 
             # Per-NetDev dispatch
             for devname in sorted(self._stateful_devs):
@@ -435,6 +434,9 @@ class NftRenderer:
                          else f"vm_{devname}_in")
             lines.append("")
             lines.append(f"    chain {chain_name} {{")
+            nd = self.rs.netdevs.get(devname)
+            if nd and nd.ctinvalid:
+                lines.append("        ct state invalid drop")
             for rl in self._fwd_chains[(devname, direction)]:
                 lines.append(f"        {rl}")
             lines.append("    }")

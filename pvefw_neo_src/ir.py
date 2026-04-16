@@ -108,6 +108,7 @@ class NetDev:
     isolated: bool = False     # Linux bridge isolated flag (語意 A)
                                #   nft: bridge link set isolated on
                                #   ovs: reg0 mark + dl_dst drop
+    ctinvalid: bool = False    # @neo:ctinvalid — drop ct_state invalid on this port
     disabled: bool = False     # @neo:disable — debug switch, 跳過整個 port
                                # backends 看到 disabled=True 就完全 skip,
                                # 封包透通（跟 port 沒出現在 IR 等價）

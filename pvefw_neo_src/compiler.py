@@ -251,6 +251,7 @@ class Compiler:
                 "nondp":       self._sugar_nondp,
                 "mcast_limit": self._sugar_mcast_limit,
                 "isolated":    self._sugar_isolated,
+                "ctinvalid":   self._sugar_ctinvalid,
                 "disable":     self._sugar_disable,
             }.get(tag.name)
             if handler:
@@ -431,6 +432,13 @@ class Compiler:
             nd = self.netdevs.get(devname)
             if nd:
                 nd.isolated = True
+
+    def _sugar_ctinvalid(self, vmid, config, nets, is_ct, rule, tag):
+        """@neo:ctinvalid → set NetDev.ctinvalid (drop ct invalid on port)."""
+        for iface, devname in self._get_iface_devnames(vmid, rule, nets, is_ct):
+            nd = self.netdevs.get(devname)
+            if nd:
+                nd.ctinvalid = True
 
     def _sugar_disable(self, vmid, config, nets, is_ct, rule, tag):
         """@neo:disable → set NetDev.disabled (debug: bypass this port).

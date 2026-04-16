@@ -452,9 +452,23 @@ class OvsRenderer:
         # Related → NORMAL
         self.flows.append(self._emit(
             TBL_FWD_IN, 28500, ["ct_state=+rel-inv"], "NORMAL"))
-        # Invalid → drop
-        self.flows.append(self._emit(
-            TBL_FWD_IN, 28000, ["ct_state=+inv"], "drop"))
+        # Per-port ct invalid drop (only ports with @neo:ctinvalid).
+        # Without opt-in, invalid packets fall through to per-port rules
+        # or NORMAL catchall — allowing asymmetric-routing traffic to pass.
+        for devname in sorted(stateful_devs):
+            nd = self.rs.netdevs.get(devname)
+            if not nd or not nd.ctinvalid:
+                continue
+            ofport = self.port_map.get(devname)
+            mac = dev_mac.get(devname)
+            if ofport:
+                self.flows.append(self._emit(
+                    TBL_FWD_IN, 28000,
+                    [f"in_port={ofport}", "ct_state=+inv"], "drop"))
+            if mac:
+                self.flows.append(self._emit(
+                    TBL_FWD_IN, 28000,
+                    [f"dl_dst={mac}", "ct_state=+inv"], "drop"))
         # Default → NORMAL (no rules = pass)
         self.flows.append(self._emit(
             TBL_FWD_IN, 0, [], "NORMAL"))
