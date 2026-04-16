@@ -259,7 +259,7 @@ class Compiler:
 
     def _sugar_macspoof(self, vmid, config, nets, is_ct, rule, tag):
         """@neo:macspoof [mac1,mac2,...] → expands to:
-           OUT DROP # @neo:stateless @neo:srcmac exact not mac1,mac2
+           OUT DROP # @neo:noct @neo:srcmac notin mac1,mac2
         Empty args = auto-read from VM config. Sugar disappears in IR."""
         for iface, devname in self._get_iface_devnames(vmid, rule, nets, is_ct):
             if tag.args:
@@ -516,7 +516,7 @@ class Compiler:
             elif mode == "notin":
                 macs = [m.strip().upper() for m in raw_val.split(",") if m.strip()]
                 match["l2"][neg_key] = macs[0] if len(macs) == 1 else macs
-            else:  # in / exact
+            else:  # in (default)
                 match["l2"][pos_key] = raw_val.upper()
 
         vlan_tag = rule.get_neo_tag("vlan")
