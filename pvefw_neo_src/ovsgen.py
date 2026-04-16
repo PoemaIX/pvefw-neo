@@ -91,8 +91,20 @@ def render(ruleset, bridge, devnames=None):
 
 
 def apply(ruleset, bridge, devnames=None):
-    """Render and atomically apply flows to an OVS bridge."""
+    """Render and atomically apply flows to an OVS bridge.
+
+    Always deletes pvefw-neo's previously-installed flows (cookie match)
+    before adding the new set, including the empty-render case. Without
+    this, clearing all rules leaves stale flows on the bridge.
+    """
     flows_text = render(ruleset, bridge, devnames)
+
+    # Always delete previous flows with our cookie first.
+    subprocess.run(
+        ["ovs-ofctl", "del-flows", bridge, f"cookie={COOKIE}/-1"],
+        capture_output=True, text=True,
+    )
+
     if not flows_text.strip():
         return True
 
@@ -102,12 +114,6 @@ def apply(ruleset, bridge, devnames=None):
     with open(flows_path, "w") as f:
         f.write(flows_text)
 
-    # Delete previous flows with our cookie
-    subprocess.run(
-        ["ovs-ofctl", "del-flows", bridge, f"cookie={COOKIE}/-1"],
-        capture_output=True, text=True,
-    )
-    # Apply new flows
     ret = subprocess.run(
         ["ovs-ofctl", "add-flows", bridge, flows_path],
         capture_output=True, text=True,
@@ -395,12 +401,40 @@ class OvsRenderer:
         # ARP → bypass to OUT
         self.flows.append(self._emit(
             TBL_CT_SEND, 1000, ["arp"], f"resubmit(,{TBL_FWD_OUT})"))
-        # IP → ct
-        self.flows.append(self._emit(
-            TBL_CT_SEND, 100, ["ip"], f"ct(table={TBL_FWD_OUT})"))
-        self.flows.append(self._emit(
-            TBL_CT_SEND, 100, ["ipv6"], f"ct(table={TBL_FWD_OUT})"))
-        # Default
+
+        # Per-stateful-port ct dispatch. Only ports that have STATEFUL rules
+        # need to invoke ct(); other traffic skips conntrack entirely and
+        # hits the table-31 priority-0 NORMAL catchall with ct_state=-trk
+        # (which doesn't match `+inv` so the invalid drop rule is harmless).
+        #
+        # We match forward (in_port=port) AND reply (dl_dst=port_mac) so ct
+        # tracking covers both directions of any flow touching a stateful
+        # port. Commit happens inside the per-port stateful rule flows
+        # (_emit_stateful_out / _emit_stateful_in) — here we only do ct
+        # lookups so existing entries classify returning packets as +est.
+        for devname in sorted(stateful_devs):
+            ofport = self.port_map.get(devname)
+            mac = dev_mac.get(devname)
+            if ofport is None or mac is None:
+                continue
+            self.flows.append(self._emit(
+                TBL_CT_SEND, 200,
+                [f"in_port={ofport}", "ip"],
+                f"ct(table={TBL_FWD_OUT})"))
+            self.flows.append(self._emit(
+                TBL_CT_SEND, 200,
+                [f"in_port={ofport}", "ipv6"],
+                f"ct(table={TBL_FWD_OUT})"))
+            self.flows.append(self._emit(
+                TBL_CT_SEND, 200,
+                [f"dl_dst={mac}", "ip"],
+                f"ct(table={TBL_FWD_OUT})"))
+            self.flows.append(self._emit(
+                TBL_CT_SEND, 200,
+                [f"dl_dst={mac}", "ipv6"],
+                f"ct(table={TBL_FWD_OUT})"))
+
+        # Default: skip ct entirely for non-stateful traffic.
         self.flows.append(self._emit(
             TBL_CT_SEND, 0, [], f"resubmit(,{TBL_FWD_OUT})"))
 

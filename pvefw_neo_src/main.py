@@ -235,8 +235,25 @@ def apply_ruleset(ir_rs, nft_text, isolated_devs, ovs_groups):
         return False
 
     # ── Apply OVS flows (per OVS bridge) ──
+    # Walk every OVS bridge on the host, not just those currently holding
+    # managed NetDevs. This way bridges that lost their last VM (or that
+    # used to have rules and no longer do) still get their stale pvefw-neo
+    # flows cleaned. ovsgen.apply() is a no-op beyond the cookie-scoped
+    # del-flows when the render is empty.
     ovs_ok = True
-    for br_name, devs in ovs_groups.items():
+    host_ovs_bridges = set()
+    try:
+        ret = subprocess.run(
+            ["ovs-vsctl", "list-br"],
+            capture_output=True, text=True,
+        )
+        if ret.returncode == 0:
+            host_ovs_bridges = {ln.strip() for ln in ret.stdout.splitlines() if ln.strip()}
+    except FileNotFoundError:
+        pass  # OVS not installed on this host
+    all_bridges = set(ovs_groups.keys()) | host_ovs_bridges
+    for br_name in sorted(all_bridges):
+        devs = ovs_groups.get(br_name, [])
         if not ovsgen.apply(ir_rs, br_name, devs):
             print(f"OVS apply failed for {br_name}", file=sys.stderr)
             ovs_ok = False

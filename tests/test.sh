@@ -257,13 +257,23 @@ test_cross_ipspoof_only_mac_forge() {
         --source "$vm_ip" --comment "@neo:ipspoof"
     fw_apply
 
-    # Save and forge the VM's src MAC. ipspoof only checks IP, so a forged
-    # MAC must NOT be dropped.
+    # The "real" MAC is what PVE config says (authoritative, not what /sys
+    # currently reports — that could already be wrong from a prior failed
+    # restore). Forge → ping → restore → verify.
     local orig_mac
-    orig_mac=$(exec_vm "cat /sys/class/net/$eth/address" | tr -d '\r\n ')
-    exec_vm "ip link set dev $eth down; ip link set dev $eth address 02:aa:bb:cc:dd:ee; ip link set dev $eth up; sleep 1" >/dev/null
+    orig_mac=$(qm config "$VMID_VM" | awk '$1=="net1:"{print}' \
+        | grep -oE '[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}' | head -1 | tr 'A-F' 'a-f')
+    exec_vm "ip link set dev $eth down && ip link set dev $eth address 02:aa:bb:cc:dd:ee && ip link set dev $eth up && sleep 1" >/dev/null
     local res; res=$(probe_ping linux 1)
-    exec_vm "ip link set dev $eth down; ip link set dev $eth address $orig_mac; ip link set dev $eth up; sleep 1" >/dev/null
+    exec_vm "ip link set dev $eth down && ip link set dev $eth address $orig_mac && ip link set dev $eth up && sleep 1" >/dev/null
+    # Verify restore — fail loudly if eth1 didn't come back up with the
+    # original MAC, otherwise subsequent tests silently misbehave.
+    local now_mac
+    now_mac=$(exec_vm "cat /sys/class/net/$eth/address" | tr -d '\r\n ')
+    if [ "$now_mac" != "$orig_mac" ]; then
+        warn "MAC restore FAILED: eth1=$now_mac expected=$orig_mac — retrying"
+        exec_vm "ip link set dev $eth down && ip link set dev $eth address $orig_mac && ip link set dev $eth up && sleep 1" >/dev/null
+    fi
 
     check "cross: ipspoof-only + forged MAC → passes (macspoof inert)" "PASS" "$res"
 }
@@ -283,21 +293,19 @@ test_cross_macspoof_only_ip_forge() {
         --comment "@neo:macspoof"
     fw_apply
 
-    # Start tcpdump in CT. Background the exec_ct call from bash (not from
-    # inside the CT) so `pct exec` actually waits for tcpdump, and we can
-    # retrieve its exit code via `wait`. `timeout` returns 0 if tcpdump
-    # exited (captured a packet), 124 on timeout.
-    local tmp; tmp=$(mktemp)
-    ( exec_ct "timeout 3 tcpdump -i $ct_eth -nn -c 1 'icmp and src host $fake_src' >/dev/null 2>&1" ) >"$tmp" 2>&1 &
-    local tpid=$!
-    sleep 0.5
-    # VM sends one ICMP echo with a spoofed src IP (but legit MAC).
+    # CT runs tcpdump in its OWN background using `nohup … &`. Polling
+    # `/tmp/cross_cap` afterwards is race-free: we don't rely on bash's
+    # `wait` propagating through pct-exec. A 2-second arm delay gives
+    # tcpdump time to attach to eth1 before hping3 fires.
+    exec_ct "rm -f /tmp/cross_cap; nohup sh -c 'tcpdump -i $ct_eth -nn -c 1 \"icmp and src host $fake_src\" > /tmp/cross_cap 2>&1' >/dev/null 2>&1 & disown" >/dev/null
+    sleep 2
     exec_vm "hping3 -a $fake_src -1 -c 1 -I eth1 $ct_ip >/dev/null 2>&1" >/dev/null
-    wait "$tpid"
-    local rc=$?
-    rm -f "$tmp"
+    # Give tcpdump up to 3s to see the packet + write the file.
+    sleep 3
+    exec_ct "pkill -f 'tcpdump.*$fake_src' 2>/dev/null; true" >/dev/null
+    local caught; caught=$(exec_ct "grep -c '$fake_src' /tmp/cross_cap 2>/dev/null || echo 0" | tr -d '\r\n ')
     local res=FAIL
-    [ "$rc" = "0" ] && res=PASS
+    [ "${caught:-0}" -ge 1 ] && res=PASS
 
     check "cross: macspoof-only + forged src IP → passes (ipspoof inert)" "PASS" "$res"
 }
@@ -506,8 +514,11 @@ run_test "Dec:vlan"                 test_vlan_linux
 run_test "Dec:rateexceed"           test_rateexceed_linux
 
 # ─── Pass 2: cross tests (only one feature enabled ⇒ others must not block) ───
-run_test "Cross:ipspoof-only + forged MAC"  test_cross_ipspoof_only_mac_forge
+# Run the non-destructive one first; mac-forge mutates VM eth1 state and has
+# to restore, so it goes last to avoid polluting subsequent tests if restore
+# flakes.
 run_test "Cross:macspoof-only + forged IP"  test_cross_macspoof_only_ip_forge
+run_test "Cross:ipspoof-only + forged MAC"  test_cross_ipspoof_only_mac_forge
 
 # ─── Pass 3: combinations of pvefw-neo features ───
 run_test "Ext:macspoof+ipspoof" test_spoof_combo_linux
