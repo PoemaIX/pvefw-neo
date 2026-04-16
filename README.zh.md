@@ -190,9 +190,7 @@ Decorator 附加在**真正的** (非 Finger) PVE 規則上。有的改變規則
 
 只允許列表中的 source MAC 通過，其餘 drop。沒給參數 = 自動從 VM config 讀。
 
-| 欄位 | 值 |
-|---|---|
-| Comment | `@neo:macspoof` 或 `@neo:macspoof` |
+`@neo:macspoof`
 
 展開成:
 
@@ -213,9 +211,7 @@ IP 清單填在 Source 欄位或者 comment 參數位(擇一)
 
 以 comment 寫法為例
 
-| 欄位 | 值 |
-|---|---|
-| Comment | `@neo:ipspoof 192.168.16.3,192.168.30.0/24,2001:db8::1,2a0a:6040::/32` |
+`@neo:ipspoof 192.168.16.3,192.168.30.0/24,2001:db8::1,2a0a:6040::/32`
 
 展開成 **2 個 pure-nomatch ipset** + **3 條 stateless 規則**（ARP / v4 / v6）:
 
@@ -247,9 +243,7 @@ IP 清單填在 Source 欄位或者 comment 參數位(擇一)
 
 阻止 VM 當 DHCP server（drop UDP sport 67/547 → dport 68/546）。
 
-| 欄位 | 值 |
-|---|---|
-| Comment | `@neo:nodhcp` |
+`@neo:nodhcp` 
 
 展開成（v4 + v6 各一條）:
 
@@ -264,9 +258,7 @@ IP 清單填在 Source 欄位或者 comment 參數位(擇一)
 
 阻止外送 IPv6 Router Advertisement。
 
-| 欄位 | 值 |
-|---|---|
-| Comment | `@neo:nora` |
+`@neo:nora`
 
 展開成:
 
@@ -277,12 +269,7 @@ IP 清單填在 Source 欄位或者 comment 參數位(擇一)
 ---
 
 #### `@neo:nondp`
-
-阻止外送 IPv6 NS/NA。
-
-| 欄位 | 值 |
-|---|---|
-| Comment | `@neo:nondp` |
+`@neo:nondp`
 
 展開成:
 
@@ -297,9 +284,7 @@ IP 清單填在 Source 欄位或者 comment 參數位(擇一)
 
 對 VM 發出的 multicast 封包做 rate limit。
 
-| 欄位 | 值 |
-|---|---|
-| Comment | `@neo:mcast_limit 100` |
+`@neo:mcast_limit 100`
 
 展開成:
 
@@ -314,9 +299,7 @@ IP 清單填在 Source 欄位或者 comment 參數位(擇一)
 在此 port 上丟棄 `ct_state=invalid` 封包（IN + OUT 都擋）。  
 未設時 invalid 封包（如非對稱路由 return traffic）會被正常規則接受。
 
-| 欄位 | 值 |
-|---|---|
-| Comment | `@neo:ct invalid` |
+`@neo:ct invalid`
 
 展開成:
 
