@@ -956,7 +956,7 @@ class Compiler:
             return
         et = match["l2"].get("ether_type")
         proto = match["l3"].get("proto", "").lower()
-        if et == "ip6" or proto == "icmpv6":
+        if et == "ip6" or proto in ("icmpv6", "ipv6-icmp"):
             match["l3"]["icmpv6_type"] = types
         else:
             match["l3"]["icmp_type"] = types

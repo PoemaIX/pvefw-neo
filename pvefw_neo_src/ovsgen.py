@@ -31,26 +31,7 @@ import sys
 from . import ir
 
 
-# ICMPv4 type name → numeric type map. Mirrors the subset PVE/iptables
-# commonly accept; anything else passes through as a literal.
-ICMP_TYPE_NUM = {
-    "echo-reply": 0,
-    "destination-unreachable": 3,
-    "source-quench": 4,
-    "redirect": 5,
-    "echo-request": 8,
-    "router-advertisement": 9,
-    "router-solicitation": 10,
-    "time-exceeded": 11,
-    "parameter-problem": 12,
-    "timestamp-request": 13,
-    "timestamp-reply": 14,
-    "info-request": 15,
-    "info-reply": 16,
-    "address-mask-request": 17,
-    "address-mask-reply": 18,
-}
-
+from . import icmp_types
 
 # OVS table assignments
 TBL_INGRESS  = 0
@@ -61,14 +42,6 @@ TBL_FWD_IN   = 31
 
 # Cookie for our flows (used for selective deletion)
 COOKIE = "0x4E30"
-
-# ICMPv6 type number map
-ICMPV6_TYPE_NUM = {
-    "nd-neighbor-solicit": 135,
-    "nd-neighbor-advert": 136,
-    "nd-router-advert": 134,
-    "nd-router-solicit": 133,
-}
 
 
 # ═══════════════════════════════════════
@@ -315,30 +288,39 @@ class OvsRenderer:
                     print(f"WARNING: OVS unknown protocol '{proto}' — "
                           f"rule may be too broad", file=sys.stderr)
 
-        # ICMPv6 type
+        # ICMP type (v4 and v6) — resolve PVE names to (type, code) via
+        # shared mapping. OVS uses icmp_type=N[,icmp_code=N] for v4,
+        # icmpv6_type=N[,icmpv6_code=N] for v6.
         if "icmp_type" in l3:
-            types = l3["icmp_type"]
-            if len(types) == 1:
-                num = ICMP_TYPE_NUM.get(types[0])
-                if num is not None:
-                    parts.append(f"icmp_type={num}")
+            for name in l3["icmp_type"][:1]:
+                entry = icmp_types.ICMPV4.get(name)
+                if entry:
+                    typ, code = entry
+                    if typ is not None:
+                        parts.append(f"icmp_type={typ}")
+                        if code is not None:
+                            parts.append(f"icmp_code={code}")
                 else:
-                    parts.append(f"icmp_type={types[0]}")
-            else:
-                # OVS has no list match for icmp_type — the variant expander
-                # splits an N-type rule into N flows before calling us.
-                num = ICMP_TYPE_NUM.get(types[0])
-                if num is not None:
-                    parts.append(f"icmp_type={num}")
+                    try:
+                        parts.append(f"icmp_type={int(name)}")
+                    except ValueError:
+                        pass
         if "icmpv6_type" in l3:
-            types = l3["icmpv6_type"]
-            if len(types) >= 1:
-                num = ICMPV6_TYPE_NUM.get(types[0])
-                if num is not None:
-                    # Need nw_proto=58 prefix
-                    if not any("nw_proto=" in p for p in parts):
-                        parts.append("nw_proto=58")
-                    parts.append(f"icmpv6_type={num}")
+            for name in l3["icmpv6_type"][:1]:
+                entry = (icmp_types.ICMPV6.get(name)
+                         or icmp_types.NFT_ICMPV6_NUM.get(name))
+                if entry:
+                    typ, code = entry
+                else:
+                    try:
+                        typ, code = int(name), None
+                    except ValueError:
+                        continue
+                if not any("nw_proto=" in p for p in parts):
+                    parts.append("nw_proto=58")
+                parts.append(f"icmpv6_type={typ}")
+                if code is not None:
+                    parts.append(f"icmpv6_code={code}")
 
         if "src_port" in l4:
             parts.append(f"tp_src={self._fmt_port(l4['src_port'])}")

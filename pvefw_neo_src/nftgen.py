@@ -18,6 +18,7 @@ NetDev with no STATEFUL rules: skipped from forward dispatch entirely
 (packets pass through without entering conntrack).
 """
 
+from . import icmp_types
 from . import ir
 
 
@@ -203,17 +204,9 @@ class NftRenderer:
             parts.append(f"meta l4proto {proto}")
 
         if "icmp_type" in l3:
-            types = l3["icmp_type"]
-            if len(types) == 1:
-                parts.append(f"icmp type {types[0]}")
-            else:
-                parts.append("icmp type { " + ", ".join(types) + " }")
+            parts.extend(self._nft_icmp_match(l3["icmp_type"], v6=False))
         if "icmpv6_type" in l3:
-            types = l3["icmpv6_type"]
-            if len(types) == 1:
-                parts.append(f"icmpv6 type {types[0]}")
-            else:
-                parts.append("icmpv6 type { " + ", ".join(types) + " }")
+            parts.extend(self._nft_icmp_match(l3["icmpv6_type"], v6=True))
 
         # ── L4 ──
         proto_name = l3.get("proto", "tcp").lower()
@@ -222,6 +215,36 @@ class NftRenderer:
         if "dst_port" in l4:
             parts.append(f"{proto_name} dport {self._fmt_port(l4['dst_port'])}")
 
+        return parts
+
+    @staticmethod
+    def _nft_icmp_match(types, v6=False):
+        """Render ICMP type match clauses for nft.
+
+        Handles PVE WebUI names including sub-types (e.g. network-unreachable
+        = type 3/code 0) and ICMPv6 name translation (PVE router-solicitation
+        → nft nd-router-solicit).
+        """
+        table = icmp_types.ICMPV6 if v6 else icmp_types.ICMPV4
+        keyword = "icmpv6" if v6 else "icmp"
+        parts = []
+        for name in types:
+            entry = table.get(name)
+            if entry is None:
+                parts.append(f"{keyword} type {name}")
+                continue
+            typ, code = entry
+            if typ is None:
+                continue
+            if v6:
+                nft_name = icmp_types.NFT_ICMPV6_NAME.get(name)
+                if nft_name and code is None:
+                    parts.append(f"{keyword} type {nft_name}")
+                    continue
+            if code is not None:
+                parts.append(f"{keyword} type {typ} {keyword} code {code}")
+            else:
+                parts.append(f"{keyword} type {name}")
         return parts
 
     @staticmethod
