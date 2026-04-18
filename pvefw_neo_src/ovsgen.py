@@ -24,6 +24,7 @@ to default NORMAL action without entering ct().
 """
 
 import copy
+import hashlib
 import ipaddress
 import subprocess
 import sys
@@ -40,8 +41,45 @@ TBL_CT_SEND  = 20
 TBL_FWD_OUT  = 30
 TBL_FWD_IN   = 31
 
-# Cookie for our flows (used for selective deletion)
-COOKIE = "0x4E30"
+# Cookie layout (64-bit):
+#   bits 63..48 : 0x4E30    (magic, identifies pvefw-neo flows)
+#   bits 47..0  : hash of source_id, or 0 for framework flows (no source)
+# Selective deletion uses the magic prefix mask only, so every pvefw-neo
+# flow is cleaned regardless of per-rule cookie.
+COOKIE_PREFIX = 0x4E30_0000_0000_0000
+COOKIE_MASK   = 0xFFFF_0000_0000_0000
+COOKIE_LEGACY = "0x4E30"   # for backwards-compat del-flows that still match
+
+# Meter IDs are 32-bit in OpenFlow 1.3. We partition the space: high 16
+# bits = 0x4E30 (magic, identifies pvefw-neo meters), low 16 bits = hash
+# of source_id. Gives 65536 independent meters per bridge, enough for any
+# realistic pvefw-neo deployment. Selective cleanup uses the prefix.
+METER_ID_PREFIX = 0x4E30_0000
+METER_ID_MASK   = 0xFFFF_0000
+
+
+def _cookie_for(source_id):
+    """Compute 64-bit cookie for a source_id (or framework flow if None)."""
+    if not source_id:
+        return COOKIE_PREFIX
+    h = hashlib.sha256(source_id.encode("utf-8")).digest()
+    low = int.from_bytes(h[:6], "big")   # 48 bits
+    return COOKIE_PREFIX | low
+
+
+def _cookie_str(source_id):
+    """ovs-ofctl cookie literal: `0xXXXXXXXXXXXXXXXX`."""
+    return f"0x{_cookie_for(source_id):016X}"
+
+
+def _meter_id_for(source_id):
+    """32-bit meter ID derived from source_id. High 16 bits fixed to
+    identify pvefw-neo ownership; low 16 bits = sha256 low-nibble of
+    source_id. Deterministic across runs so repeat applies replace cleanly.
+    """
+    h = hashlib.sha256(source_id.encode("utf-8")).digest()
+    low = int.from_bytes(h[:2], "big")
+    return METER_ID_PREFIX | low
 
 
 # ═══════════════════════════════════════
@@ -49,7 +87,7 @@ COOKIE = "0x4E30"
 # ═══════════════════════════════════════
 
 def render(ruleset, bridge, devnames=None):
-    """Render IR Ruleset → ovs-ofctl flow text for one OVS bridge.
+    """Render IR Ruleset → (flows_text, cookie_map, meters) for one bridge.
 
     Args:
       ruleset: ir.Ruleset
@@ -58,28 +96,133 @@ def render(ruleset, bridge, devnames=None):
                 If None, auto-discover from `ovs-vsctl list-ports`.
 
     Returns:
-      flows_text (str)
+      (flows_text, cookie_map, meters)
+        cookie_map : int → source_id
+        meters     : {meter_id: (rate_pps, burst_pkts)}
     """
-    return OvsRenderer(ruleset, bridge, devnames).render()
+    r = OvsRenderer(ruleset, bridge, devnames)
+    text = r.render()
+    return text, dict(r._cookie_to_source), dict(r._meters)
+
+
+def _ensure_bridge_of13(bridge):
+    """Make sure `bridge` lists OpenFlow13 in its `protocols` column so
+    add-flows with OF1.3 actions (e.g. meter references) can be negotiated.
+
+    PVE leaves `protocols=[]` on OVS bridges by default, which implies
+    OF1.0-only. Appending OpenFlow13 is additive: OF1.0 clients still
+    work, and no existing flow gets touched.
+
+    Returns True if OF1.3 is (now) in the protocol list, False on failure.
+    """
+    get = subprocess.run(
+        ["ovs-vsctl", "get", "bridge", bridge, "protocols"],
+        capture_output=True, text=True,
+    )
+    if get.returncode != 0:
+        return False
+    current = get.stdout.strip()
+    if "OpenFlow13" in current:
+        return True
+    if current == "[]":
+        protos = "OpenFlow10,OpenFlow13"
+    else:
+        inner = current.strip("[] ")
+        items = [s.strip() for s in inner.split(",") if s.strip()]
+        items.append("OpenFlow13")
+        protos = ",".join(items)
+    ret = subprocess.run(
+        ["ovs-vsctl", "set", "bridge", bridge, f"protocols={protos}"],
+        capture_output=True, text=True,
+    )
+    return ret.returncode == 0
+
+
+def _delete_our_meters(bridge):
+    """Remove every pvefw-neo-owned meter (by magic prefix) from a bridge.
+
+    Uses OF1.3 since meters don't exist in OF1.0. Never raises — bridges
+    without OF1.3 negotiation or meter support are silently ignored.
+    """
+    ret = subprocess.run(
+        ["ovs-ofctl", "-O", "OpenFlow13", "dump-meters", bridge],
+        capture_output=True, text=True,
+    )
+    if ret.returncode != 0:
+        return
+    import re
+    for line in ret.stdout.splitlines():
+        m = re.search(r"meter=(\d+)", line)
+        if not m:
+            continue
+        mid = int(m.group(1))
+        if (mid & METER_ID_MASK) == METER_ID_PREFIX:
+            subprocess.run(
+                ["ovs-ofctl", "-O", "OpenFlow13", "del-meter",
+                 bridge, f"meter={mid}"],
+                capture_output=True, text=True,
+            )
+
+
+def _install_meters(bridge, meters):
+    """Install a dict of {meter_id: (rate_pps, burst)} on a bridge.
+
+    Returns (ok, err_text). On failure, a single meter's add-meter error
+    is propagated; the caller can quarantine the owning source_id or fall
+    back to a warning.
+    """
+    for mid, (rate, burst) in sorted(meters.items()):
+        spec = (f"meter={mid},pktps,burst,"
+                f"bands=type=drop rate={rate} burst_size={burst}")
+        ret = subprocess.run(
+            ["ovs-ofctl", "-O", "OpenFlow13", "add-meter", bridge, spec],
+            capture_output=True, text=True,
+        )
+        if ret.returncode != 0:
+            return False, ret.stderr
+    return True, ""
 
 
 def apply(ruleset, bridge, devnames=None):
-    """Render and atomically apply flows to an OVS bridge.
+    """Render and atomically apply flows + meters to an OVS bridge.
 
-    Always deletes pvefw-neo's previously-installed flows (cookie match)
-    before adding the new set, including the empty-render case. Without
-    this, clearing all rules leaves stale flows on the bridge.
+    Order: delete-old-meters → delete-old-flows → install-new-meters →
+    install-new-flows. Meters first so flows that reference them don't
+    race with a half-installed meter set.
+
+    Returns (ok, err_text, flows_text, cookie_map). err_text is the raw
+    `ovs-ofctl` stderr on failure (empty on success). Callers use it to
+    pinpoint which source_id caused a rejection (via cookie_map).
     """
-    flows_text = render(ruleset, bridge, devnames)
+    flows_text, cookie_map, meters = render(ruleset, bridge, devnames)
 
-    # Always delete previous flows with our cookie first.
+    # Any rule that needs a meter forces the whole bridge onto OF1.3
+    # (bridge-level protocol list) and we'll pass `-O OpenFlow13` to
+    # ovs-ofctl. No-meter bridges stay on the default (OF1.0) path for
+    # compatibility.
+    of_args = []
+    if meters:
+        _ensure_bridge_of13(bridge)
+        of_args = ["-O", "OpenFlow13"]
+
+    # Always delete previous meters + flows with our magic prefix first.
+    _delete_our_meters(bridge)
+    mask_str = f"0x{COOKIE_PREFIX:016X}/0x{COOKIE_MASK:016X}"
     subprocess.run(
-        ["ovs-ofctl", "del-flows", bridge, f"cookie={COOKIE}/-1"],
+        ["ovs-ofctl", *of_args, "del-flows", bridge, f"cookie={mask_str}"],
         capture_output=True, text=True,
     )
 
     if not flows_text.strip():
-        return True
+        return True, "", flows_text, cookie_map
+
+    # Install meters BEFORE flows. If a meter install fails (bridge doesn't
+    # negotiate OF1.3, or meter subsystem unsupported) return the error so
+    # the quarantine layer can disable the owning rule.
+    if meters:
+        ok, err = _install_meters(bridge, meters)
+        if not ok:
+            return False, err, flows_text, cookie_map
 
     flows_path = f"/run/pvefw-neo/ovs-{bridge}.flows"
     import os
@@ -88,19 +231,20 @@ def apply(ruleset, bridge, devnames=None):
         f.write(flows_text)
 
     ret = subprocess.run(
-        ["ovs-ofctl", "add-flows", bridge, flows_path],
+        ["ovs-ofctl", *of_args, "add-flows", bridge, flows_path],
         capture_output=True, text=True,
     )
     if ret.returncode != 0:
-        print(f"ovs-ofctl add-flows failed:\n{ret.stderr}")
-        return False
-    return True
+        return False, ret.stderr, flows_text, cookie_map
+    return True, "", flows_text, cookie_map
 
 
 def flush(bridge):
-    """Remove all pvefw-neo flows from an OVS bridge, restore NORMAL."""
+    """Remove all pvefw-neo flows + meters from an OVS bridge, restore NORMAL."""
+    _delete_our_meters(bridge)
+    mask_str = f"0x{COOKIE_PREFIX:016X}/0x{COOKIE_MASK:016X}"
     subprocess.run(
-        ["ovs-ofctl", "del-flows", bridge, f"cookie={COOKIE}/-1"],
+        ["ovs-ofctl", "del-flows", bridge, f"cookie={mask_str}"],
         capture_output=True, text=True,
     )
     subprocess.run(
@@ -119,6 +263,8 @@ class OvsRenderer:
         self.bridge = bridge
         self.port_map = {}    # devname → ofport (int)
         self.flows = []
+        self._cookie_to_source = {}   # cookie_int → source_id (for error reverse lookup)
+        self._meters = {}             # meter_id → (rate_pps, burst_pkts)
         self._discover_ports()
         # Filter to devnames on this bridge
         if devnames is not None:
@@ -162,9 +308,18 @@ class OvsRenderer:
             return True
         return False
 
-    def _emit(self, table, priority, match, action):
-        """Compose a single flow entry."""
-        parts = [f"cookie={COOKIE}", f"table={table}", f"priority={priority}"]
+    def _emit(self, table, priority, match, action, source_id=None):
+        """Compose a single flow entry.
+
+        source_id (str or None): when given, the flow's cookie encodes a hash
+        of the source_id in its low 48 bits; the high 16 bits remain 0x4E30.
+        Framework flows (default resubmit / ct dispatch / isolation) pass
+        None and get cookie=0x4E30000000000000 (prefix only, no rule id).
+        """
+        cookie = _cookie_str(source_id)
+        if source_id:
+            self._cookie_to_source[_cookie_for(source_id)] = source_id
+        parts = [f"cookie={cookie}", f"table={table}", f"priority={priority}"]
         parts.extend(match)
         return ",".join(parts) + f",actions={action}"
 
@@ -470,21 +625,62 @@ class OvsRenderer:
     # ─────────────────── per-rule emitters ───────────────────
 
     def _emit_macfilter(self, devname, ofport, rule, prio):
-        """macspoof: src_mac_neg → N+1 flows (allow each whitelisted MAC at
-        higher priority, drop everything else at lower priority)."""
+        """Per-port L2-only rule → table 0 flows.
+
+        Two shapes route here (see _is_macfilter_rule):
+          1. macspoof: src_mac_neg pure-L2 → N allow + 1 catchall drop
+          2. mcast_limit: dst_mac_mask + rate_limit_pps → not supported
+             on OVS (no clean meter mapping for per-flow pps). We warn
+             and drop the rule silently rather than crash; user sees the
+             warning and falls back to a Linux bridge for rate limits.
+        """
         l2 = rule.match["l2"]
-        neg = l2["src_mac_neg"]
-        macs = neg if isinstance(neg, list) else [neg]
-        for mac in macs:
+
+        if "src_mac_neg" in l2:
+            neg = l2["src_mac_neg"]
+            macs = neg if isinstance(neg, list) else [neg]
+            for mac in macs:
+                self.flows.append(self._emit(
+                    TBL_INGRESS, prio,
+                    [f"in_port={ofport}", f"dl_src={mac.lower()}"],
+                    f"resubmit(,{TBL_RAW})",
+                    source_id=rule.source_id))
+            self.flows.append(self._emit(
+                TBL_INGRESS, prio - 1,
+                [f"in_port={ofport}"],
+                "drop",
+                source_id=rule.source_id))
+            return prio - 2
+
+        if rule.rate_limit_pps is not None and "dst_mac_mask" in l2:
+            # mcast_limit → OpenFlow meter (OF1.3). The meter's drop band
+            # fires when pps exceeds rate; within rate, the meter passes
+            # through and we resubmit to the next table like any other
+            # well-formed stateless rule. Burst 5 matches the nft backend's
+            # `limit rate over N/second burst 5 packets` default.
+            if not rule.source_id:
+                # Defensive: meter ID needs a source_id to hash. Sugar
+                # always provides one; fail loudly if something slipped.
+                print("WARNING: ovsgen: mcast_limit rule lacks source_id, "
+                      "skipping meter", file=sys.stderr)
+                return prio
+            meter_id = _meter_id_for(rule.source_id)
+            burst = 5
+            self._meters[meter_id] = (rule.rate_limit_pps, burst)
+            addr, mask = l2["dst_mac_mask"]
             self.flows.append(self._emit(
                 TBL_INGRESS, prio,
-                [f"in_port={ofport}", f"dl_src={mac.lower()}"],
-                f"resubmit(,{TBL_RAW})"))
-        self.flows.append(self._emit(
-            TBL_INGRESS, prio - 1,
-            [f"in_port={ofport}"],
-            "drop"))
-        return prio - 2
+                [f"in_port={ofport}",
+                 f"dl_dst={addr.lower()}/{mask.lower()}"],
+                f"meter:{meter_id},resubmit(,{TBL_RAW})",
+                source_id=rule.source_id))
+            return prio - 1
+
+        # Shouldn't reach here given _is_macfilter_rule's checks, but fail
+        # loudly rather than silently mis-render.
+        print(f"WARNING: ovsgen: unexpected macfilter shape, skipping: "
+              f"match={rule.match}", file=sys.stderr)
+        return prio
 
     def _emit_stateless(self, devname, ofport, rule, prio):
         """STATELESS rule → table 10 with in_port match.
@@ -502,7 +698,7 @@ class OvsRenderer:
 
         for l2m in self._expand_l2_variants(rule.match):
             neg_result = self._try_emit_pure_neg(
-                l2m, ofport, prio, pass_action)
+                l2m, ofport, prio, pass_action, rule.source_id)
             if neg_result is not None:
                 prio = neg_result
                 continue
@@ -510,11 +706,12 @@ class OvsRenderer:
             for v in self._expand_set_variants(l2m):
                 parts = self._expand_match(v)
                 self.flows.append(self._emit(
-                    TBL_RAW, prio, [f"in_port={ofport}"] + parts, action))
+                    TBL_RAW, prio, [f"in_port={ofport}"] + parts, action,
+                    source_id=rule.source_id))
             prio -= 1
         return prio
 
-    def _try_emit_pure_neg(self, match, ofport, prio, pass_action):
+    def _try_emit_pure_neg(self, match, ofport, prio, pass_action, source_id=None):
         """If match references a pure-nomatch set (src or dst), emit inverted
         flows: per-allowed-IP pass + family catchall drop. Returns new prio
         if handled, None otherwise.
@@ -545,12 +742,14 @@ class OvsRenderer:
                 self.flows.append(self._emit(
                     TBL_RAW, prio,
                     [f"in_port={ofport}"] + base_parts + [f"{ip_field}={ip}"],
-                    pass_action))
+                    pass_action,
+                    source_id=source_id))
             # Catchall drop for this family
             self.flows.append(self._emit(
                 TBL_RAW, prio - 1,
                 [f"in_port={ofport}"] + base_parts,
-                "drop"))
+                "drop",
+                source_id=source_id))
             return prio - 2
         return None
 
@@ -741,7 +940,8 @@ class OvsRenderer:
         for v in variants:
             parts = self._expand_match(v)
             self.flows.append(self._emit(
-                TBL_FWD_OUT, prio, [f"in_port={ofport}"] + parts, action))
+                TBL_FWD_OUT, prio, [f"in_port={ofport}"] + parts, action,
+                source_id=rule.source_id))
         return prio - 1
 
     def _emit_stateful_in(self, devname, mac, rule, prio):
@@ -758,7 +958,8 @@ class OvsRenderer:
         for v in variants:
             parts = self._expand_match(v)
             self.flows.append(self._emit(
-                TBL_FWD_IN, prio, [f"dl_dst={mac}"] + parts, action))
+                TBL_FWD_IN, prio, [f"dl_dst={mac}"] + parts, action,
+                source_id=rule.source_id))
         return prio - 1
 
     # ─────────────────── isolation ───────────────────

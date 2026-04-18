@@ -282,11 +282,13 @@ class NftRenderer:
         match_parts = self._render_match(rule.match)
         action = self._action_str(rule.action)
 
+        parts = list(match_parts)
         if rule.rate_limit_pps is not None:
-            limit_clause = f"limit rate over {rule.rate_limit_pps}/second"
-            line = " ".join(match_parts + [limit_clause, action])
-        else:
-            line = " ".join(match_parts + [action])
+            parts.append(f"limit rate over {rule.rate_limit_pps}/second")
+        parts.append(action)
+        if rule.source_id:
+            parts.append(f'comment "{rule.source_id}"')
+        line = " ".join(parts)
 
         if self._is_macfilter_rule(rule):
             # netdev ingress (per-device, no iif prefix needed)
@@ -315,14 +317,20 @@ class NftRenderer:
             action = "return"
 
         chain = self._fwd_chains.setdefault(key, [])
+        comment_suffix = (f' comment "{rule.source_id}"'
+                          if rule.source_id else "")
 
         if rule.log_level:
             log_clause = self._log_clause(
                 netdev.vmid, rule.log_level, key, action,
             )
-            chain.append(" ".join(match_parts + [log_clause]).strip())
+            chain.append(
+                (" ".join(match_parts + [log_clause]).strip() + comment_suffix).strip()
+            )
 
-        chain.append(" ".join(match_parts + [action]).strip())
+        chain.append(
+            (" ".join(match_parts + [action]).strip() + comment_suffix).strip()
+        )
 
     # nflog_level mapping mirrors official LogLevel::nflog_level()
     # (proxmox-nftables/src/statement.rs:232).

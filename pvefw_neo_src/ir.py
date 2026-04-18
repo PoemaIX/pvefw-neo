@@ -93,6 +93,10 @@ class Rule:
     log_level: str = None      # 選用，PVE -log emerg/alert/crit/err/warning/notice/info/debug
                                # nftgen 為非空 log_level 額外發 nflog rule（mirror official）
     comment: str = ""          # .fw 註解 + @neo: tag 原文
+    source_id: str = None      # "vm<vmid>-line<N>"，指向產生此 IR rule 的 .fw 行
+                               # 同一條 .fw rule 展開出的多條 IR rule 共用同一個 ID
+                               # 用於 backend error parsing → quarantine → .fw 寫回
+                               # None = 合成規則 (policy catch-all)，不可被 quarantine
 
 
 # ═══════════════════════════════════════
@@ -148,6 +152,13 @@ class Ruleset:
     """整個 host 的 firewall state。compiler 輸出，backend 輸入。"""
     netdevs: dict = field(default_factory=dict)   # devname → NetDev
     sets: dict = field(default_factory=dict)      # set_name → NamedSet
+    compile_rejections: dict = field(default_factory=dict)
+    # compile_rejections: source_id → reason text.
+    # Compile-time rejections (family mismatch, `rateexceed + ACCEPT`, ...)
+    # — rules that never make it into a NetDev. Apply layer folds these
+    # into the same quarantine UX as backend rejections: write back `.fw`
+    # enable=0 + firewall-log entry so the WebUI shows the unchecked
+    # checkbox and the user sees a reason.
 
     def dump(self):
         """除錯用：人類可讀表示。"""

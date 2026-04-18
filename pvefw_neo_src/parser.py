@@ -39,10 +39,15 @@ class FwRule:
         self.line_num = 0
 
     def is_sugar(self):
-        """Check if this is a sugar tag rule (Finger dummy, no leading `|` in PVE)."""
+        """Check if this is a sugar carrier rule (Finger macro + @neo: tag).
+
+        Enable state is orthogonal: caller decides whether to expand or skip.
+        An unchecked sugar rule (enable=False) means either the user manually
+        disabled the extension, or pvefw-neo auto-disabled it via quarantine.
+        """
         if not self.neo_tags:
             return False
-        return not self.enable and self.macro == "Finger"
+        return self.macro == "Finger"
 
     @property
     def enabled_in_pve(self):
@@ -122,9 +127,11 @@ def parse_rule_line(line):
     or:      GROUP group_name [-options...]
 
     PVE marks a rule as disabled by a **leading `|`** (see PVE Firewall.pm
-    line 3171: `$rule->{enable} = $line =~ s/^\\|// ? 0 : 1`). We still parse
-    disabled rules (we use them as sugar carriers for @neo: tags) but set
-    rule.enable = False so downstream knows PVE itself ignores them.
+    line 3171: `$rule->{enable} = $line =~ s/^\\|// ? 0 : 1`). We parse both
+    states; downstream (compiler) decides what to do with disabled rules.
+    Sugar carriers (Finger + @neo:) are normally enable=1 so the user sees
+    the rule as active; when pvefw-neo quarantines a broken rule it writes
+    back enable=0, which compiler treats as "skip this sugar".
     """
     line = line.strip()
     if not line:

@@ -79,6 +79,10 @@ class Compiler:
         self.netdevs = {}     # devname → ir.NetDev (in progress)
         self.sets = {}        # set_name → ir.NamedSet
         self._set_families = {}  # set_name → "ipv4" / "ipv6"
+        # source_id → reason text: rules refused at compile time. Handed
+        # to the apply layer so the same writeback + firewall-log UX as
+        # runtime backend quarantine kicks in.
+        self.compile_rejections = {}
 
     def compile(self):
         """Compile all VMs with .fw files into an IR Ruleset."""
@@ -137,7 +141,8 @@ class Compiler:
             # Translate policy_in / policy_out to explicit catch-all rules
             self._add_policy_catchalls(vmid, config, nets, is_ct)
 
-        return ir.Ruleset(netdevs=self.netdevs, sets=self.sets)
+        return ir.Ruleset(netdevs=self.netdevs, sets=self.sets,
+                          compile_rejections=self.compile_rejections)
 
     # ═══════════════════════════════════════
     # Per-VM compilation
@@ -150,12 +155,15 @@ class Compiler:
                     continue
                 self._expand_group(vmid, config, nets, is_ct, rule)
             elif rule.is_sugar():
-                # Sugar carriers are *intentionally* disabled in PVE (no leading `|`)
-                # so PVE itself ignores them; we expand them here.
+                if not rule.enable:
+                    # Unchecked sugar: user manually disabled OR pvefw-neo
+                    # auto-disabled via quarantine. Either way, skip expansion.
+                    continue
                 self._expand_sugar(vmid, config, nets, is_ct, rule)
             elif not rule.enable:
-                # Disabled rule with no @neo: meaning — honor PVE's intent and skip.
                 continue
+            elif not self._validate_l3_family(vmid, config, rule):
+                continue   # warning already printed; skip expansion
             elif rule.is_stateless():
                 self._expand_notrack(vmid, config, nets, is_ct, rule)
             else:
@@ -237,6 +245,115 @@ class Compiler:
             return ir.Direction.IN
         return ir.Direction.OUT  # FORWARD treated as OUT for now
 
+    @staticmethod
+    def _src_id(vmid, fw_rule):
+        """Build canonical source_id for a FwRule, or None if absent.
+
+        Format: `vm<vmid>-line<N>` where N is the 1-based line number in the
+        VM's .fw file. Stable across compile runs as long as the .fw doesn't
+        get edited. Shared by every IR rule that expands from the same source.
+        """
+        if fw_rule is None or not getattr(fw_rule, "line_num", 0):
+            return None
+        return f"vm{vmid}-line{fw_rule.line_num}"
+
+    def _reject_rule(self, vmid, rule, reason):
+        """Skip a rule at compile time and register it for quarantine UX.
+
+        Mirrors the backend-quarantine path: stderr warning + a
+        `{source_id: reason}` entry in self.compile_rejections, which the
+        apply layer later feeds to `materialize_quarantine` — same writeback
+        (`.fw` enable=0) + firewall-log line.
+        """
+        print(f"WARNING: vm{vmid} line {rule.line_num}: {reason} — rule skipped.",
+              file=sys.stderr, flush=True)
+        src_id = self._src_id(vmid, rule)
+        if src_id:
+            self.compile_rejections[src_id] = reason
+
+    # ═══════════════════════════════════════
+    # L3 family validation (front-end)
+    # ═══════════════════════════════════════
+    #
+    # Two-step check, rejects rules the compiler would either mangle or the
+    # backends would refuse to load.
+    #
+    #   Step 1  src × dst → l3_afs  (strict: both non-null must match)
+    #   Step 2  l3_afs ∩ ether_fam must be non-empty
+    #
+    # Partial-intersection is allowed on Step 2 only: `mixed` l3_afs with an
+    # explicit `@neo:ether ip` produces the v4 variant only (the v6 subset is
+    # silently skipped, though the NamedSet is still emitted so that other
+    # rules referencing the same ipset keep their v6 side).
+
+    def _classify_side(self, value, config):
+        """Return the address family of a src or dest value.
+
+        One of: None (absent / unresolvable), "v4", "v6", "mixed".
+        "mixed" means the value resolves to an ipset with members in both
+        IPv4 and IPv6 families.
+        """
+        if not value:
+            return None
+        resolved = self._resolve_value(value, config)
+        if resolved is None:
+            return None
+        if isinstance(resolved, dict):
+            # {fam: setname} — per-family ipset. Mixed if more than one.
+            fams = set(resolved)
+            if fams == {"ipv4"}:
+                return "v4"
+            if fams == {"ipv6"}:
+                return "v6"
+            return "mixed"
+        if isinstance(resolved, str):
+            if resolved.startswith("@"):
+                fam = self._set_families.get(resolved.lstrip("@"))
+                return "v4" if fam == "ipv4" else ("v6" if fam == "ipv6" else None)
+            # literal IP/CIDR
+            head = resolved.split("/")[0]
+            if is_ipv4(head):
+                return "v4"
+            if is_ipv6(head):
+                return "v6"
+        return None
+
+    def _validate_l3_family(self, vmid, config, rule):
+        """Front-end family-consistency check. On failure emit a stderr
+        warning and return False so the caller skips the rule (same pattern
+        as `@neo:rateexceed + ACCEPT`). Returns True if the rule is sane.
+        """
+        src_fam = self._classify_side(rule.source, config)
+        dst_fam = self._classify_side(rule.dest, config)
+
+        # Step 1: strict alignment when both sides are non-null.
+        if src_fam and dst_fam and src_fam != dst_fam:
+            self._reject_rule(vmid, rule,
+                f"src family '{src_fam}' and dst family '{dst_fam}' "
+                f"can't apply to the same packet")
+            return False
+
+        l3_afs = src_fam or dst_fam  # None if both null; else the agreed fam
+
+        # Step 2: intersect with @neo:ether.
+        ether_tag = rule.get_neo_tag("ether")
+        ether_val = (ether_tag.args[0].lower()
+                     if ether_tag and ether_tag.args else None)
+        # arp/ip → v4; ip6 → v6; unknown or absent → don't constrain.
+        ether_fam = {"arp": {"v4"}, "ip": {"v4"}, "ip6": {"v6"}}.get(ether_val)
+
+        if ether_fam is not None and l3_afs is not None:
+            l3_fam_set = ({"v4"} if l3_afs == "v4"
+                          else {"v6"} if l3_afs == "v6"
+                          else {"v4", "v6"})   # mixed
+            if not (l3_fam_set & ether_fam):
+                self._reject_rule(vmid, rule,
+                    f"l3 family '{l3_afs}' incompatible with "
+                    f"@neo:ether {ether_val}")
+                return False
+
+        return True
+
     # ═══════════════════════════════════════
     # Sugar tag expansion
     # ═══════════════════════════════════════
@@ -251,7 +368,7 @@ class Compiler:
                 "nondp":       self._sugar_nondp,
                 "mcast_limit": self._sugar_mcast_limit,
                 "isolated":    self._sugar_isolated,
-                "ct":          self._sugar_ct,
+                "ctinvdrop":   self._sugar_ctinvdrop,
                 "disable":     self._sugar_disable,
             }.get(tag.name)
             if handler:
@@ -261,6 +378,7 @@ class Compiler:
         """@neo:macspoof [mac1,mac2,...] → expands to:
            OUT DROP # @neo:noct @neo:srcmac notin mac1,mac2
         Empty args = auto-read from VM config. Sugar disappears in IR."""
+        src_id = self._src_id(vmid, rule)
         for iface, devname in self._get_iface_devnames(vmid, rule, nets, is_ct):
             if tag.args:
                 macs = [m.strip().upper() for m in tag.args[0].split(",")
@@ -277,6 +395,7 @@ class Compiler:
                 match={"l2": {"src_mac_neg": neg}},
                 action="drop",
                 comment=f"@neo:stateless @neo:srcmac notin {','.join(macs)}",
+                source_id=src_id,
             ))
 
     def _sugar_ipspoof(self, vmid, config, nets, is_ct, rule, tag):
@@ -311,6 +430,7 @@ class Compiler:
         v4 = [ip for ip in ips if is_ipv4(ip.split("/")[0])]
         v6 = [ip for ip in ips if is_ipv6(ip.split("/")[0])]
 
+        src_id = self._src_id(vmid, rule)
         for iface, devname in self._get_iface_devnames(vmid, rule, nets, is_ct):
             if not v4 and not v6:
                 continue
@@ -338,6 +458,7 @@ class Compiler:
                            "l3": {"src_set": set_v4}},
                     action="drop",
                     comment=f"@neo:noct @neo:ether arp op request,reply -source +{set_v4}",
+                    source_id=src_id,
                 ))
                 # IPv4 rule: drop when src_ip not in allow list.
                 self._add_rule(devname, ir.Rule(
@@ -347,6 +468,7 @@ class Compiler:
                            "l3": {"src_set": set_v4}},
                     action="drop",
                     comment=f"@neo:noct @neo:ether ip -source +{set_v4}",
+                    source_id=src_id,
                 ))
 
             # ── v6 pure-nomatch set ──
@@ -366,9 +488,11 @@ class Compiler:
                        "l3": {"src_set": set_v6}},
                 action="drop",
                 comment=f"@neo:noct @neo:ether ip6 -source +{set_v6}",
+                source_id=src_id,
             ))
 
     def _sugar_nodhcp(self, vmid, config, nets, is_ct, rule, tag):
+        src_id = self._src_id(vmid, rule)
         for iface, devname in self._get_iface_devnames(vmid, rule, nets, is_ct):
             self._add_rule(devname, ir.Rule(
                 direction=ir.Direction.OUT,
@@ -378,6 +502,7 @@ class Compiler:
                        "l4": {"src_port": "67", "dst_port": "68"}},
                 action="drop",
                 comment="@neo:noct @neo:ether ip -p udp -sport 67 -dport 68",
+                source_id=src_id,
             ))
             self._add_rule(devname, ir.Rule(
                 direction=ir.Direction.OUT,
@@ -387,9 +512,11 @@ class Compiler:
                        "l4": {"src_port": "547", "dst_port": "546"}},
                 action="drop",
                 comment="@neo:noct @neo:ether ip6 -p udp -sport 547 -dport 546",
+                source_id=src_id,
             ))
 
     def _sugar_nora(self, vmid, config, nets, is_ct, rule, tag):
+        src_id = self._src_id(vmid, rule)
         for iface, devname in self._get_iface_devnames(vmid, rule, nets, is_ct):
             self._add_rule(devname, ir.Rule(
                 direction=ir.Direction.OUT,
@@ -398,9 +525,11 @@ class Compiler:
                        "l3": {"icmpv6_type": ["nd-router-advert"]}},
                 action="drop",
                 comment="@neo:noct @neo:ether ip6 -icmpv6-type nd-router-advert",
+                source_id=src_id,
             ))
 
     def _sugar_nondp(self, vmid, config, nets, is_ct, rule, tag):
+        src_id = self._src_id(vmid, rule)
         for iface, devname in self._get_iface_devnames(vmid, rule, nets, is_ct):
             self._add_rule(devname, ir.Rule(
                 direction=ir.Direction.OUT,
@@ -410,12 +539,14 @@ class Compiler:
                                               "nd-neighbor-advert"]}},
                 action="drop",
                 comment="@neo:noct @neo:ether ip6 -icmpv6-type nd-neighbor-solicit,nd-neighbor-advert",
+                source_id=src_id,
             ))
 
     def _sugar_mcast_limit(self, vmid, config, nets, is_ct, rule, tag):
         if not tag.args:
             return
         pps = int(tag.args[0])
+        src_id = self._src_id(vmid, rule)
         for iface, devname in self._get_iface_devnames(vmid, rule, nets, is_ct):
             self._add_rule(devname, ir.Rule(
                 direction=ir.Direction.OUT,
@@ -425,6 +556,7 @@ class Compiler:
                 action="drop",
                 rate_limit_pps=pps,
                 comment=f"@neo:mcast_limit {pps}",
+                source_id=src_id,
             ))
 
     def _sugar_isolated(self, vmid, config, nets, is_ct, rule, tag):
@@ -434,23 +566,23 @@ class Compiler:
             if nd:
                 nd.isolated = True
 
-    def _sugar_ct(self, vmid, config, nets, is_ct, rule, tag):
-        """@neo:ct <state> as sugar (Finger carrier) → IN DROP + OUT DROP
-        with ct_state=<state>. e.g. @neo:ct invalid drops invalid on both
-        directions for the port."""
-        if not tag.args:
-            return
-        state = tag.args[0].lower()
-        if state not in ("new", "invalid"):
-            return
+    def _sugar_ctinvdrop(self, vmid, config, nets, is_ct, rule, tag):
+        """@neo:ctinvdrop → IN DROP + OUT DROP on ct_state=invalid for this port.
+
+        Dedicated sugar name (vs the @neo:ct decorator) keeps extension and
+        decorator namespaces separate: @neo:ctinvdrop only appears on Finger
+        carriers, @neo:ct only appears on real rules.
+        """
+        src_id = self._src_id(vmid, rule)
         for iface, devname in self._get_iface_devnames(vmid, rule, nets, is_ct):
             for direction in (ir.Direction.IN, ir.Direction.OUT):
                 self._add_rule(devname, ir.Rule(
                     direction=direction,
                     phase=ir.Phase.STATEFUL,
-                    match={"l3": {"ct_state": state}},
+                    match={"l3": {"ct_state": "invalid"}},
                     action="drop",
-                    comment=f"@neo:ct {state}",
+                    comment="@neo:ctinvdrop",
+                    source_id=src_id,
                 ))
 
     def _sugar_disable(self, vmid, config, nets, is_ct, rule, tag):
@@ -603,15 +735,29 @@ class Compiler:
         log_level = _normalize_log_level(rule.log)
         rate_pps = self._rate_pps_from_rule(rule)
 
+        # Front-end reject: @neo:rateexceed + ACCEPT has no sensible meaning
+        # (would mean "only accept when rate is exceeded"), and OVS meter
+        # bands only support type=drop — so the two backends would disagree
+        # if we let it through. Drop the rule; goes through the usual
+        # quarantine UX (writeback + firewall log).
+        if rate_pps is not None and action != "drop":
+            self._reject_rule(vmid, rule,
+                f"@neo:rateexceed requires action=DROP (or REJECT); "
+                f"'@neo:rateexceed + {rule.action}' is ill-defined and "
+                f"not expressible on OVS")
+            return []
+
         # Macro expansion
+        src_id = self._src_id(vmid, rule)
         if rule.macro and rule.macro != "Finger":
             results = self._expand_macro_rules(base_match, rule, action,
                                                direction, ir.Phase.STATELESS,
-                                               log_level=log_level)
+                                               log_level=log_level,
+                                               source_id=src_id)
         else:
             results = self._materialize_family_variants(
                 base_match, direction, ir.Phase.STATELESS, action,
-                log_level, rule.comment or "",
+                log_level, rule.comment or "", source_id=src_id,
             )
 
         if rate_pps is not None:
@@ -642,6 +788,7 @@ class Compiler:
                 flush=True,
             )
 
+        src_id = self._src_id(vmid, rule)
         if rule.macro:
             macro_entries = self.macros.get(rule.macro, [])
             if not macro_entries:
@@ -652,7 +799,8 @@ class Compiler:
             self._apply_src_dst(base_match, rule, config)
             return self._expand_macro_rules(base_match, rule, action,
                                            direction, ir.Phase.STATEFUL,
-                                           log_level=log_level)
+                                           log_level=log_level,
+                                           source_id=src_id)
 
         # No macro: build single rule
         match = {"l2": {}, "l3": {}, "l4": {}}
@@ -670,10 +818,11 @@ class Compiler:
 
         return self._materialize_family_variants(match, direction,
                                                  ir.Phase.STATEFUL, action,
-                                                 log_level, rule.comment or "")
+                                                 log_level, rule.comment or "",
+                                                 source_id=src_id)
 
     def _expand_macro_rules(self, base_match, rule, action, direction, phase,
-                             log_level=None):
+                             log_level=None, source_id=None):
         """Expand a PVE macro into multiple IR rules, merging with base match.
 
         For each macro entry we run the same per-family materialization as
@@ -695,6 +844,7 @@ class Compiler:
                 self._apply_icmp_type(m, rule.icmp_type)
             results.extend(self._materialize_family_variants(
                 m, direction, phase, action, log_level, rule.comment or "",
+                source_id=source_id,
             ))
         return results
 
@@ -710,9 +860,13 @@ class Compiler:
             if rule.iface and not grule.iface:
                 grule.iface = rule.iface
             if grule.is_sugar():
+                if not grule.enable:
+                    continue
                 self._expand_sugar(vmid, config, nets, is_ct, grule)
                 continue
             if not grule.enable:
+                continue
+            if not self._validate_l3_family(vmid, config, grule):
                 continue
             if grule.is_stateless():
                 self._expand_notrack(vmid, config, nets, is_ct, grule)
@@ -903,7 +1057,7 @@ class Compiler:
         return buckets
 
     def _materialize_family_variants(self, match, direction, phase, action,
-                                      log_level, comment):
+                                      log_level, comment, source_id=None):
         """Turn a match dict (possibly carrying multi-family ipset refs) into
         one or more IR rules. Mirrors official Rust per-family rule cloning."""
         if match.pop("__poison__", False):
@@ -918,6 +1072,7 @@ class Compiler:
             return [ir.Rule(
                 direction=direction, phase=phase, match=cleaned,
                 action=action, log_level=log_level, comment=comment,
+                source_id=source_id,
             )]
 
         # Determine which families to emit. If both sides are per-family,
@@ -931,10 +1086,28 @@ class Compiler:
         else:
             fams = src_fams or dst_fams
 
+        # Respect an explicit @neo:ether already baked into l2 (set by
+        # _apply_l2_primitives before we got here). Without this guard the
+        # loop below would silently overwrite `ether_type` for every family
+        # variant — e.g. `@neo:ether ip + mixed ipset` used to emit both an
+        # `ether_type=ip` and an `ether_type=ip6` rule, which contradicts
+        # the user's explicit filter. arp is treated as v4-compatible
+        # because arp saddr/daddr ip fields carry v4 addresses.
+        explicit_et = match.get("l2", {}).get("ether_type")
+
         rules = []
         for fam in sorted(fams):
+            target_et = "ip" if fam == "ipv4" else "ip6"
+            if explicit_et:
+                compatible = (target_et == "ip"
+                              if explicit_et == "arp"
+                              else target_et == explicit_et)
+                if not compatible:
+                    continue   # skip families that clash with explicit ether
             m = copy.deepcopy(match)
-            m["l2"]["ether_type"] = "ip" if fam == "ipv4" else "ip6"
+            if not explicit_et:
+                m["l2"]["ether_type"] = target_et
+            # else: keep the user's explicit value (already in m["l2"])
             if src_pf:
                 m["l3"]["src_set"] = src_pf[fam].lstrip("@")
             if dst_pf:
@@ -942,6 +1115,7 @@ class Compiler:
             rules.append(ir.Rule(
                 direction=direction, phase=phase, match=_clean_match(m),
                 action=action, log_level=log_level, comment=comment,
+                source_id=source_id,
             ))
         return rules
 

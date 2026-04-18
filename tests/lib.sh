@@ -131,11 +131,14 @@ fw_rule() {
         --action "$action" --type "$type" --enable 1 "$@" >/dev/null
 }
 
-# fw_rule_disabled : carrier rule for @neo: extensions (enable=0).
-fw_rule_disabled() {
+# fw_rule_extension : carrier rule for @neo: extensions.
+# Finger macro + @neo: comment marks the rule as a pvefw-neo extension;
+# enable=1 is the new convention so WebUI shows it as active and can
+# surface quarantine by flipping the checkbox off.
+fw_rule_extension() {
     local kind=$1 action=$2 type=$3; shift 3
     pvesh create "$(guest_fw_base $kind)/rules" \
-        --action "$action" --type "$type" --enable 0 "$@" >/dev/null
+        --action "$action" --type "$type" --enable 1 "$@" >/dev/null
 }
 
 # fw_clear <kind>  — delete every rule from the guest's firewall.
@@ -173,6 +176,33 @@ guest_alias_create()  { pvesh create "$(guest_fw_base $1)/aliases" --name "$2" -
 
 # ── Apply pvefw-neo after any firewall mutation (deterministic) ──
 fw_apply() { /root/gitrs/pvefw-neo/pvefw-neo --apply >/dev/null 2>&1 || pvefw-neo --apply >/dev/null 2>&1; }
+
+# fw_rule_enabled <kind> <pos>   → 1 or 0 (the rule's enable field)
+fw_rule_enabled() {
+    local kind=$1 pos=$2
+    pvesh get "$(guest_fw_base $kind)/rules/$pos" --output-format json 2>/dev/null \
+        | jq -r '.enable // 0'
+}
+
+# fw_log_last <kind>   → text of the most recent firewall-log entry for
+# that guest, or "" if none. Used to assert quarantine messages.
+fw_log_last() {
+    local kind=$1
+    pvesh get "$(guest_fw_base $kind)/log" --limit 50 --output-format json 2>/dev/null \
+        | jq -r '.[-1].t // ""'
+}
+
+# fw_log_has_quarantine <kind> <pos>   → YES if the latest log entry for
+# this guest matches `[pvefw-neo] invalid rule #<pos> disabled` format.
+fw_log_has_quarantine() {
+    local kind=$1 pos=$2
+    local line; line=$(fw_log_last "$kind")
+    if echo "$line" | grep -qE "\[pvefw-neo\] invalid rule #${pos} disabled, reason: "; then
+        echo YES
+    else
+        echo NO
+    fi
+}
 
 # ── Full reset between tests ──
 fw_full_reset() {

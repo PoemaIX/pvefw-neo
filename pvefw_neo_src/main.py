@@ -13,6 +13,7 @@ from . import nftgen
 from . import ovsgen
 from . import bridge
 from . import macros as macros_mod
+from . import quarantine
 from . import vmdevs
 
 
@@ -172,112 +173,126 @@ def group_netdevs_by_backend(ir_rs):
 
 
 def generate_and_check():
-    """Compile → render → syntax-check.
+    """Compile → render (no syntax check).
 
-    Returns (ir_rs, nft_text, isolated_devs, ovs_groups) or (ir_rs, None, ...) on failure.
+    Returns (ir_rs, nft_text, isolated_devs, ovs_groups). nft_text is the
+    rendered output for the full IR (pre-quarantine); daemon uses it for
+    cheap change detection. Apply layer re-renders per iteration as needed.
     """
     ir_rs = compile_ir()
     groups = group_netdevs_by_backend(ir_rs)
-
-    # Render nftables for linux bridge ports
     nft_text, isolated_devs = nftgen.render(ir_rs, groups["linux"])
-
-    # Syntax check
-    os.makedirs("/run/pvefw-neo", exist_ok=True)
-    tmp_path = RULESET_PATH + ".tmp"
-    with open(tmp_path, "w") as f:
-        f.write(nft_text)
-
-    ret = subprocess.run(
-        ["nft", "-c", "-f", tmp_path],
-        capture_output=True, text=True,
-    )
-    if ret.returncode != 0:
-        print(f"nft syntax check failed:\n{ret.stderr}", file=sys.stderr)
-        return ir_rs, None, isolated_devs, groups["ovs"]
-
     return ir_rs, nft_text, isolated_devs, groups["ovs"]
 
 
-def apply_ruleset(ir_rs, nft_text, isolated_devs, ovs_groups):
-    """Apply nftables ruleset, OVS flows, and bridge isolation."""
-    os.makedirs("/run/pvefw-neo", exist_ok=True)
-
-    # ── Clean up orphaned netdev tables (disabled or removed ports) ──
-    # The ruleset only flushes tables it's about to recreate. Tables for
-    # ports that used to be managed but aren't now (e.g. @neo:disable,
-    # firewall=1 added, VM deleted) would otherwise linger.
+def _cleanup_orphaned_netdev_tables():
+    """Drop any leftover `table netdev pvefw-neo-*` — they'd otherwise
+    accumulate from ports that used to be managed but aren't now (e.g.
+    @neo:disable, firewall=1 added, VM deleted). Safe to run before every
+    apply: tables we're about to recreate get replaced with fresh content.
+    """
     ret = subprocess.run(
         ["nft", "list", "tables"],
         capture_output=True, text=True,
     )
-    if ret.returncode == 0:
-        for line in ret.stdout.splitlines():
-            parts = line.strip().split()
-            # "table netdev pvefw-neo-<devname>"
-            if len(parts) == 3 and parts[0] == "table" and parts[1] == "netdev" \
-                    and parts[2].startswith("pvefw-neo-"):
-                subprocess.run(
-                    ["nft", "delete", "table", "netdev", parts[2]],
-                    capture_output=True, text=True,
-                )
-
-    # ── Apply nftables (linux bridge ports) ──
-    with open(RULESET_PATH, "w") as f:
-        f.write(nft_text)
-
-    ret = subprocess.run(
-        ["nft", "-f", RULESET_PATH],
-        capture_output=True, text=True,
-    )
     if ret.returncode != 0:
-        print(f"nft apply failed:\n{ret.stderr}", file=sys.stderr)
-        return False
+        return
+    for line in ret.stdout.splitlines():
+        parts = line.strip().split()
+        if len(parts) == 3 and parts[0] == "table" and parts[1] == "netdev" \
+                and parts[2].startswith("pvefw-neo-"):
+            subprocess.run(
+                ["nft", "delete", "table", "netdev", parts[2]],
+                capture_output=True, text=True,
+            )
 
-    # ── Apply OVS flows (per OVS bridge) ──
-    # Walk every OVS bridge on the host, not just those currently holding
-    # managed NetDevs. This way bridges that lost their last VM (or that
-    # used to have rules and no longer do) still get their stale pvefw-neo
-    # flows cleaned. ovsgen.apply() is a no-op beyond the cookie-scoped
-    # del-flows when the render is empty.
-    ovs_ok = True
-    host_ovs_bridges = set()
+
+def _host_ovs_bridges():
+    """Every OVS bridge on this host, or empty set if OVS not installed."""
     try:
         ret = subprocess.run(
             ["ovs-vsctl", "list-br"],
             capture_output=True, text=True,
         )
-        if ret.returncode == 0:
-            host_ovs_bridges = {ln.strip() for ln in ret.stdout.splitlines() if ln.strip()}
     except FileNotFoundError:
-        pass  # OVS not installed on this host
-    all_bridges = set(ovs_groups.keys()) | host_ovs_bridges
-    for br_name in sorted(all_bridges):
-        devs = ovs_groups.get(br_name, [])
-        if not ovsgen.apply(ir_rs, br_name, devs):
-            print(f"OVS apply failed for {br_name}", file=sys.stderr)
-            ovs_ok = False
+        return set()
+    if ret.returncode != 0:
+        return set()
+    return {ln.strip() for ln in ret.stdout.splitlines() if ln.strip()}
 
-    # ── Apply bridge isolation (always reconcile, even if empty) ──
-    bridge.apply_isolation(isolated_devs)
+
+def apply_ruleset(ir_rs):
+    """Apply ruleset with progressive quarantine of bad rules.
+
+    Returns (ok, final_nft_text). On full success (even after quarantining
+    some rules), ok=True and final_nft_text reflects the applied state
+    (minus quarantined rules). On unrecoverable failure, ok=False.
+    """
+    os.makedirs("/run/pvefw-neo", exist_ok=True)
+
+    groups = group_netdevs_by_backend(ir_rs)
+    # Walk every OVS bridge on the host, not just those currently holding
+    # managed NetDevs. Bridges that lost their last VM still need their
+    # stale pvefw-neo flows cleaned.
+    all_bridges = sorted(set(groups["ovs"].keys()) | _host_ovs_bridges())
+    ovs_targets = [(br, groups["ovs"].get(br, [])) for br in all_bridges]
+
+    # Stash the final rendered nft text so the caller can cache it for
+    # change detection. Closure receives filtered IR each quarantine round.
+    final_text = {"nft": "", "isolated": []}
+
+    def nft_render(filtered):
+        text, iso = nftgen.render(filtered, groups["linux"])
+        final_text["nft"] = text
+        final_text["isolated"] = iso
+        return text, iso
+
+    ok, quarantined = quarantine.apply_with_quarantine(
+        ir_rs,
+        nft_renderer=nft_render,
+        ruleset_path=RULESET_PATH,
+        ovs_bridges=ovs_targets,
+        isolation_hook=bridge.apply_isolation,
+        pre_nft_hook=_cleanup_orphaned_netdev_tables,
+    )
+
+    if not ok:
+        return False, None
+
+    # Fold compile-time rejections (family mismatch, rateexceed+ACCEPT, ...)
+    # into the same dict as backend quarantine. Both get identical UX:
+    # .fw checkbox unchecked + firewall-log entry. Backend entries have
+    # richer error text (from nft/ovs stderr); compile entries have the
+    # validator's own reason string.
+    all_quarantined = dict(ir_rs.compile_rejections)
+    all_quarantined.update(quarantined)
+
+    if all_quarantined:
+        quarantine.materialize_quarantine(all_quarantined)
+        for sid, err in all_quarantined.items():
+            first_line = err.strip().splitlines()[0] if err.strip() else "(no detail)"
+            print(f"pvefw-neo: auto-disabled {sid}: {first_line}",
+                  file=sys.stderr)
 
     # ── Save state ──
     netdev_count = len(ir_rs.netdevs)
     state = {
         "applied_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "netdev_count": netdev_count,
-        "isolated_devs": isolated_devs,
-        "linux_bridges": True if nft_text else False,
-        "ovs_bridges": list(ovs_groups.keys()),
+        "isolated_devs": final_text["isolated"],
+        "linux_bridges": bool(final_text["nft"]),
+        "ovs_bridges": list(groups["ovs"].keys()),
+        "quarantined": sorted(all_quarantined.keys()),
     }
     with open(STATE_PATH, "w") as f:
         json.dump(state, f, indent=2)
 
-    ovs_str = (f", {sum(len(d) for d in ovs_groups.values())} OVS netdevs"
-               if ovs_groups else "")
+    ovs_str = (f", {sum(len(d) for d in groups['ovs'].values())} OVS netdevs"
+               if groups["ovs"] else "")
+    q_str = f", {len(all_quarantined)} quarantined" if all_quarantined else ""
     print(f"Applied ruleset: {netdev_count} netdevs total{ovs_str}, "
-          f"{len(isolated_devs)} isolated ports")
-    return ovs_ok
+          f"{len(final_text['isolated'])} isolated ports{q_str}")
+    return True, final_text["nft"]
 
 
 def flush_ruleset():
@@ -368,11 +383,11 @@ def daemon_loop():
 
     print("pvefw-neo daemon starting (inotify mode)")
 
-    # Initial apply
-    ir_rs, nft_text, iso_devs, ovs_groups = generate_and_check()
-    if nft_text is not None:
-        apply_ruleset(ir_rs, nft_text, iso_devs, ovs_groups)
-    _last_nft_text = nft_text
+    # Initial apply. apply_ruleset returns the final (post-quarantine) text
+    # which we cache for change detection on the next iteration.
+    ir_rs, _, _, _ = generate_and_check()
+    ok, applied_text = apply_ruleset(ir_rs)
+    _last_nft_text = applied_text if ok else None
 
     # Snapshot OVS ports for change detection
     ovs_snapshot = snapshot_ovs_ports()
@@ -425,12 +440,22 @@ def daemon_loop():
         # Run on every iteration (event or None) so filtered-out events
         # don't starve the apply check.
         if pending and (now - last_event_time) >= DEBOUNCE_SECONDS:
-            ir_rs, nft_text, iso_devs, ovs_groups = generate_and_check()
-            # Apply if nft text changed OR OVS topology changed
-            if nft_text is not None and (nft_text != _last_nft_text or ovs_changed):
+            ir_rs, nft_text, _, _ = generate_and_check()
+            # Three triggers for apply:
+            #   (1) rendered nft text changed → backend reload needed
+            #   (2) OVS topology changed → reinstall flows
+            #   (3) compile rejected any rule → materialize writeback even
+            #       if no backend reload is needed. Without this, a user
+            #       re-ticking a previously-rejected rule would leave the
+            #       IR unchanged (rule still skipped by validator), so the
+            #       no-op skip would bypass the .fw writeback + firewall
+            #       log and the checkbox would never flip back.
+            if (nft_text != _last_nft_text or ovs_changed
+                    or ir_rs.compile_rejections):
                 print(f"Reloading after {DEBOUNCE_SECONDS}s of quiet...")
-                apply_ruleset(ir_rs, nft_text, iso_devs, ovs_groups)
-                _last_nft_text = nft_text
+                ok, applied_text = apply_ruleset(ir_rs)
+                if ok:
+                    _last_nft_text = applied_text
             ovs_snapshot = snapshot_ovs_ports()
             pending = False
             ovs_changed = False
@@ -442,13 +467,16 @@ def _poll_loop():
     last_hash = None
 
     while True:
-        ir_rs, nft_text, iso_devs, ovs_groups = generate_and_check()
-        if nft_text is not None:
-            import hashlib
-            h = hashlib.sha256(nft_text.encode()).hexdigest()
-            if h != last_hash:
-                apply_ruleset(ir_rs, nft_text, iso_devs, ovs_groups)
-                last_hash = h
+        ir_rs, nft_text, _, _ = generate_and_check()
+        import hashlib
+        h = hashlib.sha256(nft_text.encode()).hexdigest()
+        # Apply if rendered text changed OR compile rejected any rule
+        # (same reason as daemon_loop — IR-invisible rejections still
+        # need to reach the writeback/log path).
+        if h != last_hash or ir_rs.compile_rejections:
+            ok, applied_text = apply_ruleset(ir_rs)
+            if ok:
+                last_hash = hashlib.sha256(applied_text.encode()).hexdigest()
         time.sleep(10)
 
 
@@ -492,16 +520,18 @@ def main():
 
     if args.dump_ovs:
         ir_rs = compile_ir()
-        flows_text = ovsgen.render(ir_rs, args.dump_ovs)
+        flows_text, _, _ = ovsgen.render(ir_rs, args.dump_ovs)
         print(flows_text)
         sys.exit(0)
 
     if args.apply_ovs:
         ir_rs = compile_ir()
-        if ovsgen.apply(ir_rs, args.apply_ovs):
+        ok, err, _, _ = ovsgen.apply(ir_rs, args.apply_ovs)
+        if ok:
             print(f"Applied OVS flows to {args.apply_ovs}")
         else:
-            print(f"Failed to apply OVS flows to {args.apply_ovs}", file=sys.stderr)
+            print(f"Failed to apply OVS flows to {args.apply_ovs}:\n{err}",
+                  file=sys.stderr)
             sys.exit(1)
         sys.exit(0)
 
@@ -519,12 +549,9 @@ def main():
     if args.apply:
         if not preflight_check():
             sys.exit(1)
-        ir_rs, nft_text, iso_devs, ovs_groups = generate_and_check()
-        if nft_text is None:
-            sys.exit(1)
-        if not apply_ruleset(ir_rs, nft_text, iso_devs, ovs_groups):
-            sys.exit(1)
-        sys.exit(0)
+        ir_rs, _, _, _ = generate_and_check()
+        ok, _ = apply_ruleset(ir_rs)
+        sys.exit(0 if ok else 1)
 
     if args.daemon:
         if not preflight_check():
@@ -533,9 +560,8 @@ def main():
         # Handle signals
         def handle_hup(signum, frame):
             print("Received SIGHUP, reloading...")
-            ir_rs, nft_text, iso_devs, ovs_groups = generate_and_check()
-            if nft_text is not None:
-                apply_ruleset(ir_rs, nft_text, iso_devs, ovs_groups)
+            ir_rs, _, _, _ = generate_and_check()
+            apply_ruleset(ir_rs)
 
         def handle_term(signum, frame):
             print("Received SIGTERM, flushing and exiting...")

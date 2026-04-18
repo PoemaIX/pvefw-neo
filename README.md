@@ -94,7 +94,7 @@ of PVE rules, prefixed with `@neo:`
 
 These rules provide functionality not available in PVE's native firewall.  
 Since PVE WebUI has no corresponding fields, we cannot edit them directly.  
-We borrow the long-obsolete **Finger** protocol (TCP/79) as a carrier (marked as **disabled** so PVE ignores it), and write the real rules in the comment field.
+We borrow the long-obsolete **Finger** protocol (TCP/79) as a carrier and write the real rules in the comment field. Because the per-NIC firewall checkbox is off, PVE never actually renders the Finger rule into iptables/nftables — so leaving the rule **Enabled** is safe and preferred: the WebUI shows it as active, and if pvefw-neo has to auto-disable it due to an apply failure, the checkbox flipping off is an immediate visual cue.
 
 **WebUI steps** (`VM → Firewall → Add`)
 
@@ -103,10 +103,12 @@ First fill in the following fields (shared skeleton for all extension rules):
 | Field | Value |
 |---|---|
 | Direction | `out` |
-| **Enable** | **unchecked** ← important |
+| **Enable** | **checked** |
 | Action | `DROP` |
 | Macro | `Finger` |
 | Source / Comment | filled per tag (see below) |
+
+> Unchecking a Finger+`@neo:` rule is how you **turn that extension off**. pvefw-neo also sets the checkbox to unchecked automatically when nftables/OVS rejects the compiled rule (see "Quarantine" behavior).
 
 
 | Tag | Effect |
@@ -141,7 +143,33 @@ Use real macros / actions, and **check Enable** in the WebUI.
 | `@neo:dstmac notin <mac1,mac2>` | This rule only applies to packets whose destination MAC does NOT match `<mac>`. |
 | `@neo:dstmac bitmask <mask>` | Match destination MAC by bitmask (`field & mac == mac`). |
 | `@neo:vlan <untagged\|vid1,vid2>` | Only apply to traffic on the specified VLAN(s).<br>Used when a trunk port is given to a VM and rules should only apply to a specific inner VLAN. |
-| `@neo:rateexceed <pps>` | Only match the portion of traffic **exceeding** `<pps>`.<br>Packets within the rate budget don't match and fall through to the next rule.<br>**`@neo:stateless` only** — not supported on `@neo:ct` rules. |
+| `@neo:rateexceed <pps>` | Only match the portion of traffic **exceeding** `<pps>`.<br>Packets within the rate budget don't match and fall through to the next rule.<br>**Constraints:** `@neo:stateless` only (not on `@neo:ct`), **and action must be `DROP`/`REJECT`**. `ACCEPT + rateexceed` has no sensible meaning and OVS meters can't express an "accept" band — compiler rejects with a warning and drops the rule. |
+
+### L3 address-family validation
+
+A rule's source, dest and `@neo:ether` tag must agree on IP family or the
+compiler skips the rule with a stderr warning (no backend quarantine —
+the rule simply doesn't make it to nft/OVS).
+
+**Step 1 — src × dst alignment (strict).** When both `source` and `dest`
+are non-null, their families must match exactly: `v4 == v4`, `v6 == v6`,
+`mixed == mixed` (an ipset containing both families counts as `mixed`).
+Any other combination is rejected (e.g. `source 10.0.0.5 / dest 2001:db8::1`).
+The agreed family becomes `l3_afs`; if one side is null the other decides.
+
+**Step 2 — `l3_afs × @neo:ether` intersection (partial).** `@neo:ether ip`
+and `@neo:ether arp` both mean v4 (ARP's spa/tpa fields are v4); `@neo:ether ip6`
+means v6. When the rule is `mixed` l3_afs and `@neo:ether` is explicit,
+the compiler emits **only the matching-family variant** — the other family
+is silently skipped for this rule, but the ipset definition stays intact so
+other rules referencing the same set still get their full set.
+
+| l3_afs ↓ / @neo:ether → | *(none)* | `ip` | `ip6` | `arp` |
+|---|---|---|---|---|
+| *(none)* | OK | OK | OK | OK |
+| v4 | OK | OK | **REJECT** | OK |
+| v6 | OK | **REJECT** | OK | **REJECT** |
+| mixed | OK (emit v4 + v6) | OK (emit v4 only) | OK (emit v6 only) | OK (emit v4 only) |
 
 **Examples:**
 
@@ -295,12 +323,12 @@ Expands to:
 
 ---
 
-#### `@neo:ct invalid` (sugar usage)
+#### `@neo:ctinvdrop`
 
 Drop `ct_state=invalid` packets on this port (both IN + OUT).  
 Without this, invalid packets (e.g. asymmetric routing return traffic) are accepted by matching rules.
 
-`@neo:ct invalid`
+`@neo:ctinvdrop`
 
 Expands to:
 
@@ -309,8 +337,7 @@ Expands to:
 | `in`  | `DROP` | `@neo:ct invalid` |
 | `out` | `DROP` | `@neo:ct invalid` |
 
-> Note: `@neo:ct invalid` can also be used as a **decorator** attached directly to a regular rule (see Decorator tags section).
-> In that case, no Finger carrier is needed — it provides more granular per-rule control.
+> Extension vs decorator are now **separate namespaces**: use `@neo:ctinvdrop` only on Finger carriers (sugar), use `@neo:ct invalid` only on real rules (decorator). They produce similar behavior but are written in different places — the decorator form lets you drop invalid packets only when a specific match triggers, rather than unconditionally.
 
 The compilation pipeline is:
 
@@ -334,6 +361,41 @@ pvefw-neo --preflight-check   # verify host.fw enable=0 + nftables=1
 
 ---
 
+## Quarantine
+
+When a rule can't be compiled — either by the front-end validator
+(family mismatch, `rateexceed + ACCEPT`, ...) or by `nft` / `ovs-ofctl`
+rejecting it at load time — pvefw-neo **auto-disables** the rule:
+
+1. The `.fw` line is rewritten to prepend `|` (PVE's disable marker),
+   so the WebUI checkbox visibly flips to unchecked.
+2. A single line is appended to `/var/log/pve-firewall.log` so the
+   **VM → Firewall → Log** tab shows, for example:
+
+   ```
+   [pvefw-neo] invalid rule #8 disabled, reason: <nft/ovs error or
+   validator explanation>
+   ```
+
+3. The remaining (valid) rules keep working — the bad rule is the only
+   thing that doesn't make it into nft/OVS.
+
+Reverse-routing the backend error to the right source rule uses:
+
+- **nft**: each rule carries `comment "vm<vmid>-line<N>"`. nft's stderr
+  echoes the failing rule verbatim, so parsing is a simple substring
+  match.
+- **OVS**: each flow's cookie is `0x4E30<48-bit hash(source_id)>`; each
+  meter ID is `0x4E30<16-bit hash>`. `ovs-ofctl` prints
+  `<flows-file>:<N>: <reason>`, we read that line, extract the cookie,
+  look up the source_id.
+
+To recover: edit or delete the rule in the WebUI and re-check the
+checkbox. The next apply will retry; if the rule is still broken it
+gets quarantined again and a new log line appears.
+
+---
+
 ## Limitations
 
 | Limitation | Reason |
@@ -341,7 +403,7 @@ pvefw-neo --preflight-check   # verify host.fw enable=0 + nftables=1
 | `REJECT` becomes `DROP` | `bridge` family and OVS don't support REJECT. Peer times out. |
 | `Finger` macro reserved as sugar carrier | TCP/79 is unused in practice. |
 | OVS isolation needs ≥2 isolated ports to take effect | "Two isolated ports cannot communicate" — a single isolated port is meaningless. |
-| `@neo:rateexceed` only on `@neo:stateless` | stateful + rate limit semantics can't be cleanly expressed in the OVS meter model. |
+| `@neo:rateexceed` only on `@neo:stateless` | Stateful + rate-limit semantics can't be cleanly expressed in the OVS meter model. (Stateless `mcast_limit` on OVS is implemented via OF1.3 meters; pvefw-neo auto-adds `OpenFlow13` to the bridge's `protocols` list when needed.) |
 | OVS backend expands ipsets via CIDR pre-subtraction | Flow table size grows with ipset member count. Small sets are fine, large ones may be slow to compile. |
 | `@neo:` tags live in the comment field | PVE WebUI's comment field has a length limit. Split complex rules across multiple lines. |
 
@@ -357,8 +419,13 @@ pvefw-neo --dump-ir              # backend-agnostic IR
 pvefw-neo --dry-run              # nftables text
 pvefw-neo --dump-ovs vmbr2       # OVS flows for a bridge
 
+# Inspect what actually got installed
 nft list table bridge pvefw-neo
-ovs-ofctl dump-flows vmbr2 | grep "cookie=0x4e30"
+ovs-ofctl dump-flows vmbr2 | grep 'cookie=0x4e30'
+ovs-ofctl -O OpenFlow13 dump-meters vmbr2   # rate-limit meters
+
+# Inspect the quarantine audit trail (per-VM in WebUI Log tab)
+tail -50 /var/log/pve-firewall.log | grep pvefw-neo
 
 pvefw-neo --flush && systemctl restart pvefw-neo
 ```

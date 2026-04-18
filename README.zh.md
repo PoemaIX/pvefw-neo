@@ -93,7 +93,7 @@ daemon 會在數秒內偵測變動並重新套用。
 
 這類規則是 PVE native firewall 沒提供的功能  
 因為 PVE WebUI 沒有對應欄位，我們無法直接編輯  
-所以我們借用幾十年前已經沒人用的 **Finger** 協定（TCP/79）作為載體(並標記為 **disabled**)，把真正的規則寫在 comment 欄位  
+所以我們借用幾十年前已經沒人用的 **Finger** 協定（TCP/79）作為載體，把真正的規則寫在 comment 欄位。因為 NIC firewall checkbox 是關的，PVE 根本不會把這條 Finger rule 渲染到 iptables/nftables —— 所以**保持 Enabled** 是安全且建議的做法：WebUI 顯示為 active，萬一 pvefw-neo 因為 apply 失敗而自動 disable 這條規則，checkbox 被取消打勾會是立即的視覺警示。
 
 **WebUI 操作步驟**（`VM → Firewall → Add`)
 
@@ -102,10 +102,12 @@ daemon 會在數秒內偵測變動並重新套用。
 | 欄位 | 值 |
 |---|---|
 | Direction | `out` |
-| **Enable** | **不要打勾** ← 重要 |
+| **Enable** | **打勾** |
 | Action | `DROP` |
 | Macro | `Finger` |
 | Source / Comment | 依 tag 填寫（見下） |
+
+> 取消打勾就是**關掉該條 extension**。當 pvefw-neo 發現編譯後的規則被 nftables/OVS 拒絕時，也會自動把 checkbox 取消打勾（詳見「Quarantine」說明）。
 
 
 | Tag | 效果 |
@@ -140,7 +142,29 @@ Decorator 附加在**真正的** (非 Finger) PVE 規則上。有的改變規則
 | `@neo:dstmac notin <mac1,mac2>` | 此規則只套用到 destnation MAC 不等於 `<mac>` 的封包 |
 | `@neo:dstmac bitmask <mask>` | 以 bitmask 匹配 destnation MAC（`field & mac == mac`）。 |
 | `@neo:vlan <untagged\|vid1,vid2>` | 只套用到指定 VLAN 的流量<br>用於 trunk port 給 VM 時，規則只作用在內層某 VLAN |
-| `@neo:rateexceed <pps>` | 只匹配規則條件中**超過** `<pps>` 的部分<br>rate 內的封包不匹配，落到下一條規則<br>**僅限 `@neo:stateless`**，不支援`@neo:ct` 規則 |
+| `@neo:rateexceed <pps>` | 只匹配規則條件中**超過** `<pps>` 的部分<br>rate 內的封包不匹配，落到下一條規則<br>**限制**：僅限 `@neo:stateless`、**action 必須是 `DROP`/`REJECT`**。`ACCEPT + rateexceed` 語意不合理，且 OVS meter 沒有 accept band —— compiler 會 warn 並整條跳過 |
+
+### L3 家族一致性驗證
+
+規則的 source、dest、`@neo:ether` 三者必須家族相容，否則 compiler 會印
+warning、跳過該 rule（不進 nft/OVS，也不走 quarantine）。
+
+**Step 1 — src × dst 對齊（嚴格）**：兩邊都非 null 時，家族必須完全相同
+（`v4 == v4`、`v6 == v6`、`mixed == mixed`；mixed 指 ipset 同時含 v4/v6 成員）。
+不同就擋（例：`source 10.0.0.5 / dest 2001:db8::1`）。產出 `l3_afs`；單邊
+null 就由另一邊決定。
+
+**Step 2 — `l3_afs × @neo:ether` 部分相交**：`@neo:ether ip` 和 `@neo:ether arp`
+都是 v4（ARP 的 spa/tpa 欄位是 v4），`@neo:ether ip6` 是 v6。當 `l3_afs=mixed`
+且 `@neo:ether` 寫死時，compiler 只產出**匹配家族的那組變體**，另一側靜默跳過
+（但 NamedSet 定義照樣寫入，其他 rule 引用時仍有完整 set 可用）。
+
+| l3_afs ↓ / @neo:ether → | *(不寫)* | `ip` | `ip6` | `arp` |
+|---|---|---|---|---|
+| *(null)* | OK | OK | OK | OK |
+| v4 | OK | OK | **REJECT** | OK |
+| v6 | OK | **REJECT** | OK | **REJECT** |
+| mixed | OK（產 v4 + v6） | OK（只產 v4） | OK（只產 v6） | OK（只產 v4） |
 
 **範例** — ：
 
@@ -294,12 +318,12 @@ IP 清單填在 Source 欄位或者 comment 參數位(擇一)
 
 ---
 
-#### `@neo:ct invalid`（語法糖用法）
+#### `@neo:ctinvdrop`
 
 在此 port 上丟棄 `ct_state=invalid` 封包（IN + OUT 都擋）。  
 未設時 invalid 封包（如非對稱路由 return traffic）會被正常規則接受。
 
-`@neo:ct invalid`
+`@neo:ctinvdrop`
 
 展開成:
 
@@ -308,8 +332,7 @@ IP 清單填在 Source 欄位或者 comment 參數位(擇一)
 | `in`  | `DROP` | `@neo:ct invalid` |
 | `out` | `DROP` | `@neo:ct invalid` |
 
-> 注意：`@neo:ct invalid` 也可以作為 **decorator** 直接附加在一般規則上（見 Decorator tags 章節），
-> 此時不需要 Finger 載體，而是更精細的 per-rule 控制。
+> Extension 和 decorator 現在是**獨立命名空間**：`@neo:ctinvdrop` 只用在 Finger 載體（sugar），`@neo:ct invalid` 只用在真實規則上（decorator）。行為類似，但寫的位置不同 —— decorator 形式可以讓 invalid drop 只在特定條件匹配時才觸發，而不是無條件。
 
 所以編譯流程是：
 
@@ -333,6 +356,37 @@ pvefw-neo --preflight-check   # 檢查 host.fw enable=0 + nftables=1
 
 ---
 
+## Quarantine
+
+當一條 rule 編譯不出來時 —— 不管是前端 validator 擋掉（家族衝突、
+`rateexceed + ACCEPT` 等）還是 `nft` / `ovs-ofctl` 載入時拒絕 ——
+pvefw-neo 會**自動 disable**：
+
+1. 把 `.fw` 那行加上 leading `|`（PVE 的 disable 標記），WebUI 上該條
+   rule 的 Enable checkbox 直接變 unchecked。
+2. 往 `/var/log/pve-firewall.log` 加一行，於是 **VM → Firewall → Log**
+   分頁看得到：
+
+   ```
+   [pvefw-neo] invalid rule #8 disabled, reason: <nft/ovs 錯誤訊息或
+   validator 原因>
+   ```
+
+3. 其他合法 rule 照常運作，只有被 quarantine 的那條不會進 nft/OVS。
+
+後端錯誤反向路由對應到正確 source rule 的機制：
+
+- **nft**：每條 rule 帶 `comment "vm<vmid>-line<N>"`。nft 錯誤會把原文
+  列印出來（含 comment），子字串匹配即可還原 source_id。
+- **OVS**：每條 flow 的 cookie 是 `0x4E30<48-bit hash(source_id)>`；
+  每條 meter 的 ID 是 `0x4E30<16-bit hash>`。`ovs-ofctl` 失敗印
+  `<flows-file>:<N>: <reason>` → 讀該行 → 取 cookie → 查回 source_id。
+
+恢復方式：在 WebUI 編輯 rule 內容後重新勾選 Enable。下次 apply 會重試；
+若還是錯的就再次 quarantine + 新增一行 log。
+
+---
+
 ## 限制
 
 | 限制 | 原因 |
@@ -340,7 +394,7 @@ pvefw-neo --preflight-check   # 檢查 host.fw enable=0 + nftables=1
 | `REJECT` 變成 `DROP` | `bridge` family 和 OVS 都不支援 REJECT，對端只會 timeout。 |
 | `Finger` macro 保留作為語法糖載體 | TCP/79 實際沒人用。 |
 | OVS isolation 需要 ≥2 個 isolated port 才生效 | 「兩個 isolated port 互相不通」— 只有一個 isolated port 沒意義。 |
-| `@neo:rateexceed` 只支援 `@neo:stateless` | stateful + rate limit 的語意在 OVS meter 模型下無法乾淨表達。 |
+| `@neo:rateexceed` 只支援 `@neo:stateless` | stateful + rate limit 的語意在 OVS meter 模型下無法乾淨表達。（無狀態的 `mcast_limit` 已走 OF1.3 meter 實作；需要時 pvefw-neo 會自動把 `OpenFlow13` 加進 bridge 的 `protocols`） |
 | OVS 後端以 CIDR 預先相減展開 ipset | 流量表大小隨 ipset 成員數成長；小集合沒問題，大集合編譯會慢。 |
 | `@neo:` 標籤寫在 comment 欄位 | PVE WebUI 的 comment 欄有長度限制，複雜規則要拆多行。 |
 
@@ -356,8 +410,13 @@ pvefw-neo --dump-ir              # 後端無關的 IR
 pvefw-neo --dry-run              # nftables 文字
 pvefw-neo --dump-ovs vmbr2       # 某個 bridge 的 OVS flows
 
+# 看實際裝上去的東西
 nft list table bridge pvefw-neo
-ovs-ofctl dump-flows vmbr2 | grep "cookie=0x4e30"
+ovs-ofctl dump-flows vmbr2 | grep 'cookie=0x4e30'
+ovs-ofctl -O OpenFlow13 dump-meters vmbr2   # rate-limit meters
+
+# 看 quarantine 歷史（per-VM 在 WebUI Log 分頁也看得到）
+tail -50 /var/log/pve-firewall.log | grep pvefw-neo
 
 pvefw-neo --flush && systemctl restart pvefw-neo
 ```

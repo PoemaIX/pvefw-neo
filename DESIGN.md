@@ -1,9 +1,9 @@
 # pvefw-neo Design Document
 
-> **Version**: 4.0 — 2026-04-12
-> **Status**: Implemented + tested. Production-ready.
+> **Version**: 5.0 — 2026-04-19
+> **Status**: Implemented + tested.
 
-> 📖 安裝/使用說明請見 [README.md](README.md) (English) 或 [README.zh_TW.md](README.zh_TW.md) (繁體中文)
+> 📖 安裝/使用說明請見 [README.md](README.md) (English) 或 [README.zh.md](README.zh.md) (繁體中文)
 
 ---
 
@@ -88,7 +88,7 @@ VM tap device
 [netdev ingress]        ← per-device, MAC filter, mcast ratelimit
      │
      ▼
-bridge raw_prerouting   ← @neo:notrack 規則、語法糖展開的規則
+bridge raw_prerouting   ← @neo:noct 規則、語法糖展開的規則
      │                     priority raw (-300), 在 conntrack 之前
      ▼
 bridge forward          ← 原生 stateful 規則
@@ -112,7 +112,7 @@ PVE macro 定義在 `Firewall.pm` 的 `$pve_fw_macros` Perl hash 中。
 
 pvefw-neo 中的每條規則屬於兩類之一：
 
-| | 原生規則（無 @neo tag） | `@neo:notrack` 規則 |
+| | 原生規則（無 @neo tag） | `@neo:noct` 規則 |
 |---|---|---|
 | nftables chain | `bridge forward` (priority filter) | `bridge raw_prerouting` (priority raw) |
 | conntrack | **有**，`ct state established,related` 生效 | **無**，per-packet 獨立評估 |
@@ -127,7 +127,7 @@ pvefw-neo 中的每條規則屬於兩類之一：
 ```
 封包從 tap100i0 出來：
 
-  1) bridge raw_prerouting（@neo:notrack 規則 + 語法糖展開）
+  1) bridge raw_prerouting（@neo:noct 規則 + 語法糖展開）
      ├── 按 .fw 檔案中的出現順序評估
      ├── 命中 ACCEPT → 封包通過，繼續到下一層
      ├── 命中 DROP   → 封包丟棄，結束
@@ -163,19 +163,22 @@ pvefw-neo 把它映射到對應的 `tap`/`veth` device name。
 
 ### 5.1 兩層設計
 
-**語法糖**：一條規則搞定常見場景，不用管順序。用 Finger dummy 規則作為載體，
-**加上開頭的 `|`** — PVE 把開頭 `|` 的 rule 視為 disabled（見 `PVE/Firewall.pm:3171`）
-直接忽略，但 pvefw-neo 透過 comment 裡的 `@neo:` tag 認得它並展開成真正的規則。
+**語法糖 (Extension rules)**：一條規則搞定常見場景，不用管順序。用 `Finger` macro
+作為 carrier，PVE 實際上不會把它渲染到 iptables/nftables（因為 NIC firewall 是關的），
+但 pvefw-neo 透過 comment 裡的 `@neo:` tag 辨識並展開。**Enable=1（打勾）是新的預設**：
+WebUI 顯示為 active、`.fw` 裡不帶 `|`，未來 quarantine 自動把它翻成 `|`（uncheck）時
+使用者一眼看到 checkbox 變化。
 
-**底層原語**：附加在正常規則上（這些是「正常啟用」的規則，**不加** `|`），
-使用者自己控制順序和組合。
+**Decorator**：附加在正常規則上，使用者自己控制順序和組合，也是 enable=1。
 
-> ⚠️ PVE `.fw` 語法：`|` = disabled，沒 `|` = enabled。WebUI 的 enable 開關就是加/去 `|`。
+> ⚠️ `|OUT ... # @neo:xxx`（舊式 enable=0 的 Finger 規則）現在**一律當作「pvefw-neo
+> 跳過」**：要嘛使用者手動 disable、要嘛 quarantine 寫回。使用者想讓規則生效就維持
+> 打勾（沒有 `|`）。
 
-### 5.2 語法糖（Finger dummy，leading `|` = disabled）
+### 5.2 語法糖（Finger carrier，預設 enable=1）
 
-語法糖自動展開成多條 nftables 規則，使用者不需要理解展開細節。
-必須搭配 `-i netX` 指定 port。
+語法糖自動展開成多條 nftables/OVS 規則，使用者不需要理解展開細節。
+必須搭配 `-i netX` 指定 port（除非該 sugar 本身 per-VM）。
 
 #### `@neo:ipspoof <ip,...>`
 
@@ -183,7 +186,7 @@ pvefw-neo 把它映射到對應的 `tap`/`veth` device name。
 同時防護 ARP spoofing 和 NDP spoofing（自動展開）。
 
 ```
-|OUT Finger(DROP) -i net0 # @neo:ipspoof 10.0.0.100/32,fd00::100/128
+OUT Finger(DROP) -i net0 # @neo:ipspoof 10.0.0.100/32,fd00::100/128
 ```
 
 展開為（bridge raw_prerouting, NOTRACK）：
@@ -221,13 +224,13 @@ iifname "tap100i0" ether type ip6 drop
 防止 MAC spoofing。只允許指定的 source MAC，其他 drop。
 
 ```
-|OUT Finger(DROP) -i net0 # @neo:macspoof 02:00:00:00:01:00
+OUT Finger(DROP) -i net0 # @neo:macspoof 02:00:00:00:01:00
 ```
 
 不帶參數時自動從 VM config 讀取 MAC：
 
 ```
-|OUT Finger(DROP) -i net0 # @neo:macspoof
+OUT Finger(DROP) -i net0 # @neo:macspoof
 ```
 
 展開為（netdev ingress）：
@@ -242,7 +245,7 @@ ether saddr != 02:00:00:00:01:00 drop
 禁止 VM 充當 DHCP server。
 
 ```
-|OUT Finger(DROP) -i net0 # @neo:nodhcp
+OUT Finger(DROP) -i net0 # @neo:nodhcp
 ```
 
 展開為（bridge raw_prerouting, NOTRACK）：
@@ -257,7 +260,7 @@ iifname "tap100i0" ether type ip6 udp sport 547 udp dport 546 drop
 禁止 VM 發送 Router Advertisement。
 
 ```
-|OUT Finger(DROP) -i net0 # @neo:nora
+OUT Finger(DROP) -i net0 # @neo:nora
 ```
 
 展開為：
@@ -271,7 +274,7 @@ iifname "tap100i0" ether type ip6 icmpv6 type nd-router-advert drop
 禁止 VM 發送 NDP（Neighbor Solicitation / Advertisement）。
 
 ```
-|OUT Finger(DROP) -i net0 # @neo:nondp
+OUT Finger(DROP) -i net0 # @neo:nondp
 ```
 
 展開為：
@@ -285,7 +288,7 @@ iifname "tap100i0" ether type ip6 icmpv6 type { nd-neighbor-solicit, nd-neighbor
 限制 multicast 封包速率。
 
 ```
-|OUT Finger(DROP) -i net0 # @neo:mcast_limit 100
+OUT Finger(DROP) -i net0 # @neo:mcast_limit 100
 ```
 
 展開為（netdev ingress，最早攔截）：
@@ -300,7 +303,7 @@ ether daddr & 01:00:00:00:00:00 == 01:00:00:00:00:00 limit rate over 100/second 
 啟用 port isolation。該 port 無法與同 bridge 上的其他 VM port 通訊。
 
 ```
-|OUT Finger(DROP) -i net2 # @neo:isolated
+OUT Finger(DROP) -i net2 # @neo:isolated
 ```
 
 展開為：
@@ -317,18 +320,49 @@ iifname "tap100i2" oifname "veth*" drop
 bridge link set dev tap100i2 isolated on
 ```
 
+#### `@neo:ctinvdrop`
+
+在此 port 上同時 IN + OUT 都 drop `ct_state=invalid` 封包。防止非對稱路由
+回程被當成一般規則 accept。
+
+```
+OUT Finger(DROP) -i net0 # @neo:ctinvdrop
+```
+
+展開為（bridge forward，stateful）：
+
+```nft
+oifname "tap100i0" ct state invalid drop
+iifname "tap100i0" ct state invalid drop
+```
+
+> 歷史：早期這個功能寫作 `@neo:ct invalid`（sugar 形式）。後來為了讓
+> extension（sugar）和 decorator 完全分開命名空間，改成 `@neo:ctinvdrop`。
+> `@neo:ct invalid` 仍然存在，但只作為 decorator（掛在真實 stateful rule 上）。
+
+#### `@neo:disable`
+
+debug 用：完全不處理該 port，所有封包 fall-through。實作上 pvefw-neo
+對該 NetDev 不產出任何 rule（沒有 netdev table、沒進 forward dispatch）。
+
+```
+OUT Finger(DROP) -i net0 # @neo:disable
+```
+
+不帶 `-i netN` 時對 VM 全部 port 生效。
+
 ### 5.3 底層原語（附加在正常規則上）
 
-底層原語附加在**真正要執行的規則**上（不是 Finger dummy）。
+底層原語附加在**真正要執行的規則**上（不是 Finger carrier）。
 使用者自己控制規則的順序和組合。
 
-#### `@neo:notrack`
+#### `@neo:noct`
 
 標記這條規則走 raw chain（NOTRACK），不建立也不查詢 conntrack entry。
 
 ```
-|OUT ACCEPT -i net0 -source 192.168.6.2/32 # @neo:notrack
-|OUT DROP   -i net0                        # @neo:notrack
+OUT ACCEPT -i net0 -source 192.168.6.2/32 # @neo:noct
+OUT DROP   -i net0                        # @neo:noct
 ```
 
 翻譯為 bridge raw_prerouting：
@@ -338,51 +372,93 @@ iifname "tap100i0" ether type ip ip saddr 192.168.6.2/32 accept
 iifname "tap100i0" drop
 ```
 
-**順序重要**：多條 `@neo:notrack` 規則按 `.fw` 檔案中的出現順序排列。
+**順序重要**：多條 `@neo:noct` 規則按 `.fw` 檔案中的出現順序排列。
 使用者有責任確保先 ACCEPT 再 DROP。
 
-#### `@neo:srcmac` / `@neo:dstmac` `<exact|bitmask> <mac>`
+#### `@neo:srcmac` / `@neo:dstmac` `<in|notin|bitmask> <mac[,mac2,...]>`
 
 為規則附加 MAC 地址 match 條件，限縮規則的套用範圍。可搭配
-`@neo:notrack` 或一般 stateful 規則使用。
+`@neo:noct` 或一般 stateful 規則使用。
 
 ```
-# srcmac exact：source MAC 等於 02:00:00:00:01:00
-|IN ACCEPT -i net0 -p tcp -dport 22 # @neo:srcmac exact 02:00:00:00:01:00
+# srcmac in：source MAC 等於 02:00:00:00:01:00
+IN ACCEPT -i net0 -p tcp -dport 22 # @neo:srcmac in 02:00:00:00:01:00
+
+# srcmac notin：source MAC 不屬於清單（多值）
+OUT DROP -i net0 # @neo:noct @neo:srcmac notin 02:00:00:00:01:00,02:00:00:00:02:00
 
 # dstmac bitmask：destination MAC & 01:00:... == 01:00:...（multicast bit）
-|OUT DROP -i net0 # @neo:notrack @neo:dstmac bitmask 01:00:00:00:00:00
+OUT DROP -i net0 # @neo:noct @neo:dstmac bitmask 01:00:00:00:00:00
 ```
 
-- `exact <mac>` → `ether saddr/daddr == mac`
+- `in <mac[,mac2]>` → `ether saddr/daddr ∈ {set}`
+- `notin <mac[,mac2]>` → `ether saddr/daddr ∉ {set}`
 - `bitmask <mac>` → `ether saddr/daddr & mac == mac`
-- 不寫模式時預設 `exact`
+- 不寫模式時預設 `in`
+
+#### `@neo:ether <arp|ip|ip6>`
+
+強制 rule 的 ethertype。搭配混合家族 ipset 時會讓 compiler 只產出匹配家族的
+變體（詳見 §5.5）。
+
+```
+# 限定 ARP 封包、源 IP 在某 set 內才 accept
+OUT ACCEPT -i net0 -source +guest/trusted_v4 # @neo:noct @neo:ether arp
+```
+
+#### `@neo:ct [new|invalid]` (decorator)
+
+限定 stateful rule 的 ct_state：
+- 不帶參數：matches all reachable states（等於不寫，只是讓意圖明確）
+- `new`：只匹配新連線
+- `invalid`：只匹配 invalid 封包
+
+掛在真實 rule 上。sugar 版的「IN+OUT 兩條 invalid drop」寫 `@neo:ctinvdrop`（見 §5.2）。
 
 #### `@neo:rateexceed <pps>`
 
-只匹配該規則條件中**超過** `<pps>` 的封包；rate 內的封包落到下一條規
-則。**僅支援 `@neo:notrack`**：stateful 規則上的 `@neo:rateexceed` 會
-被忽略並送出 WARNING。
+只匹配該規則條件中**超過** `<pps>` 的封包；rate 內的封包落到下一條規則。
+
+**限制**：
+- **僅支援 `@neo:noct`**（stateful rule 的 `@neo:rateexceed` 會被忽略並印 WARNING）
+- **Action 必須是 `DROP` / `REJECT`**。`ACCEPT + rateexceed` 語意不合理（「只有
+  超過速率才接受」），而 OVS meter band 只支援 `drop` 類型，accept 無對應。
+  compiler 前端直接拒絕並 auto-disable（走 quarantine 流程）
 
 ```
 # 單 VM multicast ratelimit，drop 超出 100 pps 的部分
-|OUT DROP -i net0 # @neo:notrack @neo:rateexceed 100 @neo:dstmac bitmask 01:00:00:00:00:00
+OUT DROP -i net0 # @neo:noct @neo:rateexceed 100 @neo:dstmac bitmask 01:00:00:00:00:00
 ```
 
-翻譯為：
+**nftables 翻譯**：
 
 ```nft
 iifname "tap100i0" ether daddr & 01:00:00:00:00:00 == 01:00:00:00:00:00 \
-    limit rate over 100/second drop
+    limit rate over 100/second burst 5 packets drop
 ```
+
+**OVS 翻譯**（OF1.3 meter）：
+
+```
+# 先裝 meter (per-rule ID，高 16 bit = 0x4E30 magic，低 16 bit = hash(source_id))
+ovs-ofctl -O OpenFlow13 add-meter vmbr3 \
+    meter=<id>,pktps,burst,bands=type=drop rate=100 burst_size=5
+# flow 使用 meter action
+cookie=0x4E30...,table=0,priority=N,
+  in_port=N,dl_dst=01:...:00/01:...:00,
+  actions=meter:<id>,resubmit(,10)
+```
+
+在 rate 之內 meter pass → resubmit 繼續下一階段；超過 rate → meter 的 drop band 丟封包。
+pvefw-neo 會自動把 `OpenFlow13` 加進 bridge 的 `protocols` 清單（如果還沒有）。
 
 #### `@neo:vlan <vid|untagged>`
 
 為規則附加 VLAN match 條件。指定規則只套用於特定 VLAN 的流量。
 
 ```
-|OUT ACCEPT -i net0 -source 10.0.0.100/32 # @neo:notrack @neo:vlan 20
-|OUT DROP   -i net0                       # @neo:notrack @neo:vlan 20
+OUT ACCEPT -i net0 -source 10.0.0.100/32 # @neo:noct @neo:vlan 20
+OUT DROP   -i net0                       # @neo:noct @neo:vlan 20
 ```
 
 語法：
@@ -415,21 +491,57 @@ ether type != 8021q
 
 ### 5.4 Tag 總表
 
-| Tag | 類型 | Finger dummy? | Chain | 用途 |
-|-----|------|--------------|-------|------|
-| `@neo:ipspoof <ip,...>` | 語法糖 | ✅ leading `|` | bridge raw | IP + ARP + NDP spoofing prevention |
-| `@neo:macspoof [mac]` | 語法糖 | ✅ leading `|` | netdev ingress | MAC spoofing prevention |
-| `@neo:nodhcp` | 語法糖 | ✅ leading `|` | bridge raw | 禁止當 DHCP server |
-| `@neo:nora` | 語法糖 | ✅ leading `|` | bridge raw | 禁止發 RA |
-| `@neo:nondp` | 語法糖 | ✅ leading `|` | bridge raw | 禁止發 NDP |
-| `@neo:mcast_limit <pps>` | 功能 | ✅ leading `|` | netdev ingress | multicast ratelimit |
-| `@neo:isolated` | 功能 | ✅ leading `|` | bridge fwd + kernel | port isolation |
-| `@neo:disable` | 功能 | ✅ leading `|` | 跳過整個 port | debug：該 port 完全不處理 |
-| `@neo:notrack` | 原語 | ❌ 正常規則 | bridge raw | 規則走 raw chain |
-| `@neo:srcmac <exact\|bitmask> <mac>` | decorator | ❌ 正常規則 | 隨所附加規則 | 加 source MAC match 條件 |
-| `@neo:dstmac <exact\|bitmask> <mac>` | decorator | ❌ 正常規則 | 隨所附加規則 | 加 dest MAC match 條件 |
-| `@neo:vlan <vid\|untagged>` | decorator | ❌ 正常規則 | 隨所附加規則 | 加 VLAN match 條件 |
-| `@neo:rateexceed <pps>` | decorator | ❌ 正常規則 | bridge raw | 只匹配超出 pps 的封包（僅限 notrack）|
+所有 tag 都寫在 PVE rule 的 comment 欄位。Sugar 類用 `Finger` macro 當載體、
+decorator 類掛在真實規則上。**兩類規則都預設 enable=1**（打勾）；`.fw` 裡出現
+leading `|` 一律代表「pvefw-neo 跳過」——使用者手動 disable 或 quarantine 寫回。
+
+| Tag | 類型 | 載體 | 實作位置 | 用途 |
+|-----|------|------|---------|------|
+| `@neo:ipspoof <ip,...>` | sugar | Finger | bridge raw / OVS tbl 10 | IP + ARP + NDP spoofing prevention |
+| `@neo:macspoof [mac]` | sugar | Finger | netdev ingress / OVS tbl 0 | MAC spoofing prevention |
+| `@neo:nodhcp` | sugar | Finger | bridge raw / OVS tbl 10 | 禁止當 DHCP server |
+| `@neo:nora` | sugar | Finger | bridge raw / OVS tbl 10 | 禁止發 RA |
+| `@neo:nondp` | sugar | Finger | bridge raw / OVS tbl 10 | 禁止發 NDP |
+| `@neo:mcast_limit <pps>` | sugar | Finger | netdev ingress / OVS tbl 0 + OF1.3 meter | multicast ratelimit |
+| `@neo:isolated` | sugar | Finger | bridge fwd + kernel / OVS reg0 | port isolation |
+| `@neo:ctinvdrop` | sugar | Finger | bridge forward / OVS tbl 30+31 | IN+OUT drop ct_state=invalid |
+| `@neo:disable` | sugar | Finger | 跳過整個 port | debug：該 port 完全不處理 |
+| `@neo:noct` (alias: `stateless`) | decorator | 正常規則 | bridge raw / OVS tbl 10 | 規則走 raw chain（不進 conntrack）|
+| `@neo:ct [new\|invalid]` | decorator | 正常規則 | bridge forward / OVS tbl 30+31 | 限定 ct_state |
+| `@neo:ether <arp\|ip\|ip6>` | decorator | 正常規則 | 隨規則 | 強制 ethertype |
+| `@neo:srcmac <in\|notin\|bitmask> <mac[,...]>` | decorator | 正常規則 | 隨規則 | source MAC match |
+| `@neo:dstmac <in\|notin\|bitmask> <mac[,...]>` | decorator | 正常規則 | 隨規則 | dest MAC match |
+| `@neo:vlan <vid\|untagged>` | decorator | 正常規則 | 隨規則 | VLAN match |
+| `@neo:rateexceed <pps>` | decorator | 正常規則 | bridge raw / OVS OF1.3 meter | 只匹配超出 pps 的封包（僅限 `@neo:noct` + `DROP`）|
+
+### 5.5 L3 家族一致性驗證（前端 validator）
+
+前端 compile 時會檢查 source / dest / `@neo:ether` 三者的 IP 家族是否合理。
+不合理的 rule 會在 compile 階段跳過，並走跟後端 quarantine 完全一樣的 UX：
+`.fw` 寫回 `|`、WebUI checkbox 變 unchecked、firewall log 出現一行
+`[pvefw-neo] invalid rule #N disabled, reason: ...`。
+
+**Step 1 — `src × dst` 嚴格對齊**：兩邊都非 null 時家族必須完全相等（`v4 == v4`、
+`v6 == v6`、`mixed == mixed`）。`src=v4 + dst=v6` / `src=v4 + dst=mixed_ipset`
+全部擋掉。結果寫入 `l3_afs ∈ {null, v4, v6, mixed}`。
+
+**Step 2 — `l3_afs × @neo:ether` 部分相交**：
+
+| l3_afs ↓ / ether → | *(none)* | `ip` | `ip6` | `arp` |
+|---|---|---|---|---|
+| *(null)* | OK | OK | OK | OK |
+| v4 | OK | OK | **REJECT** | OK |
+| v6 | OK | **REJECT** | OK | **REJECT** |
+| mixed | OK (產 v4+v6) | OK (只產 v4) | OK (只產 v6) | OK (只產 v4) |
+
+`ether_fam`：`ip`/`arp` → v4（ARP 的 spa/tpa 欄位是 v4）、`ip6` → v6、不寫 →
+{v4, v6}。`mixed` 搭配 explicit ether 時，compiler 只產出匹配家族的變體，另一
+家族靜默跳過；NamedSet 定義照樣寫入（其他 rule 要引用仍拿得到完整 set）。
+
+**為什麼要這層驗證**：沒有它的話，兩個 backend 會出現不一致行為（nft 寬容接受
+「legal but never-match」、OVS 嚴格拒絕），而且 compiler 內部的 family-split 會
+**靜默覆寫**使用者寫的 `@neo:ether`。前端擋掉能給使用者明確反饋，也省掉後端
+quarantine 冗餘。
 
 ---
 
@@ -442,12 +554,12 @@ ether type != 8021q
 例如 `.fw` 中的規則順序：
 
 ```
-|OUT Finger(DROP) -i net0 # @neo:macspoof 02:00:00:00:01:00
-|OUT Finger(DROP) -i net0 # @neo:ipspoof 10.0.0.100/32
-|OUT ACCEPT -i net0 -source 10.0.0.0/24 # @neo:notrack
-|OUT DROP   -i net0                     # @neo:notrack
-|IN  SSH(ACCEPT) -source 10.0.0.0/24 -i net0
-|IN  DROP -i net0
+OUT Finger(DROP) -i net0 # @neo:macspoof 02:00:00:00:01:00
+OUT Finger(DROP) -i net0 # @neo:ipspoof 10.0.0.100/32
+OUT ACCEPT -i net0 -source 10.0.0.0/24 # @neo:noct
+OUT DROP   -i net0                     # @neo:noct
+IN  SSH(ACCEPT) -source 10.0.0.0/24 -i net0
+IN  DROP -i net0
 ```
 
 生成的 nftables 規則按相同順序排列：
@@ -463,7 +575,7 @@ iifname "tap100i0" ether type ip ip saddr 10.0.0.100/32 accept
 iifname "tap100i0" ether type ip drop
 iifname "tap100i0" ether type ip6 drop
 
-# @neo:notrack 規則（按原始順序）
+# @neo:noct 規則（按原始順序）
 iifname "tap100i0" ether type ip ip saddr 10.0.0.0/24 accept
 iifname "tap100i0" drop
 
@@ -479,7 +591,7 @@ oifname "tap100i0" drop
 雖然在 `.fw` 中穿插排列，生成時按目標 chain 分組：
 
 1. **netdev ingress**（per-device table）：`@neo:macspoof`、`@neo:mcast_limit`
-2. **bridge raw_prerouting**：`@neo:ipspoof`、`@neo:nodhcp`、`@neo:nora`、`@neo:nondp`、`@neo:notrack` 規則
+2. **bridge raw_prerouting**：`@neo:ipspoof`、`@neo:nodhcp`、`@neo:nora`、`@neo:nondp`、`@neo:noct` 規則
 3. **bridge forward**：原生 stateful 規則（無 @neo tag）、`@neo:isolated`
 
 同一個 chain 內，規則按 `.fw` 中的出現順序排列。
@@ -615,29 +727,29 @@ mgmt_gw 10.0.0.1
 
 [RULES]
 # ── 語法糖 ──
-|OUT Finger(DROP) -i net0 # @neo:macspoof
-|OUT Finger(DROP) -i net0 # @neo:ipspoof 10.0.0.100/32
-|OUT Finger(DROP) -i net0 # @neo:nodhcp
-|OUT Finger(DROP) -i net0 # @neo:nora
+OUT Finger(DROP) -i net0 # @neo:macspoof
+OUT Finger(DROP) -i net0 # @neo:ipspoof 10.0.0.100/32
+OUT Finger(DROP) -i net0 # @neo:nodhcp
+OUT Finger(DROP) -i net0 # @neo:nora
 
-|OUT Finger(DROP) -i net1 # @neo:macspoof 02:00:00:00:02:00
-|OUT Finger(DROP) -i net1 # @neo:nodhcp
-|OUT Finger(DROP) -i net1 # @neo:nora
+OUT Finger(DROP) -i net1 # @neo:macspoof 02:00:00:00:02:00
+OUT Finger(DROP) -i net1 # @neo:nodhcp
+OUT Finger(DROP) -i net1 # @neo:nora
 
-|OUT Finger(DROP) -i net2 # @neo:macspoof
-|OUT Finger(DROP) -i net2 # @neo:isolated
-|OUT Finger(DROP) -i net2 # @neo:mcast_limit 100
+OUT Finger(DROP) -i net2 # @neo:macspoof
+OUT Finger(DROP) -i net2 # @neo:isolated
+OUT Finger(DROP) -i net2 # @neo:mcast_limit 100
 
 # ── 底層原語：net1 BGP notrack ACL ──
-|OUT ACCEPT -i net1 -source 169.254.0.0/16 # @neo:notrack
-|OUT ACCEPT -i net1 -source 10.100.0.0/16  # @neo:notrack
-|OUT DROP   -i net1                        # @neo:notrack
+OUT ACCEPT -i net1 -source 169.254.0.0/16 # @neo:noct
+OUT ACCEPT -i net1 -source 10.100.0.0/16  # @neo:noct
+OUT DROP   -i net1                        # @neo:noct
 
 # ── 原生 stateful rules ──
-|IN  SSH(ACCEPT)   -source 10.0.0.0/24 -i net0
-|IN  HTTPS(ACCEPT) -source 10.0.0.0/24 -i net0
-|IN  BGP(ACCEPT)   -i net1
-|OUT ACCEPT
+IN  SSH(ACCEPT)   -source 10.0.0.0/24 -i net0
+IN  HTTPS(ACCEPT) -source 10.0.0.0/24 -i net0
+IN  BGP(ACCEPT)   -i net1
+OUT ACCEPT
 ```
 
 生成的 nftables：
@@ -808,9 +920,9 @@ myserver = 10.0.1.100
 10.0.1.100
 
 [RULES]
-|IN SSH(ACCEPT) -source 10.0.0.0/24
-|OUT ACCEPT
-|OUT Finger(DROP) -i net0 # @neo:ipspoof 10.0.0.100/32
+IN SSH(ACCEPT) -source 10.0.0.0/24
+OUT ACCEPT
+OUT Finger(DROP) -i net0 # @neo:ipspoof 10.0.0.100/32
 ```
 
 ### 9.2 解析流程
@@ -823,7 +935,7 @@ myserver = 10.0.1.100
    b. 解析 comment 中的 `@neo:` tags
    c. 分類：
       - Finger dummy + `@neo:` sugar tag → 展開成 NOTRACK 規則
-      - 正常規則 + `@neo:notrack` → 放入 raw chain
+      - 正常規則 + `@neo:noct` → 放入 raw chain
       - 正常規則 + `@neo:srcmac`/`@neo:dstmac`/`@neo:vlan` → 加上對應 L2 match
       - 正常規則 + `@neo:rateexceed` (僅限 notrack) → 設定 rate limit
       - 正常規則（無 tag） → 放入 forward chain（stateful）
@@ -1040,7 +1152,7 @@ pvefw-neo 管理的 VM NIC 必須設 `firewall=0` 或不設：
 
 ```ini
 [RULES]
-|OUT Finger(DROP) -i net0 # @neo:disable
+OUT Finger(DROP) -i net0 # @neo:disable
 ```
 
 加這一行之後：
@@ -1075,9 +1187,57 @@ silent stale state。
 
 ### 10.5 Atomic apply
 
-- **nftables**：生成 `.nft` 文字檔，先 `nft -c -f` 語法檢查，再 `nft -f` 原子載入
-- **OVS**：用 cookie `0x4E30` 標記自己的 flow，apply 前 `ovs-ofctl del-flows cookie=0x4E30/-1`，然後 `ovs-ofctl add-flows`
-- **Bridge isolation**：reconcile 模式 — 每次 apply 把所有非 isolated 的 linux bridge port 設為 `isolated off`，然後把該 isolated 的設為 `on`，避免 stale state
+- **nftables**：生成 `.nft` 文字檔，`nft -f` 原子載入。失敗 → 整個 ruleset rollback（沒有半套狀態）
+- **OVS**：per-bridge `del-flows cookie=<prefix>/<mask>` + `add-flows`；有 meter 時先 `add-meter`
+- **Bridge isolation**：reconcile 模式 — 每次 apply 把所有非 isolated 的 linux bridge port 設為 `isolated off`，再把該 isolated 的設為 `on`，避免 stale state
+
+### 10.6 Quarantine（錯誤處理）
+
+當某條使用者 rule 無法成功編譯或被後端拒絕時，pvefw-neo 把它「隔離」：
+不進 IR、不進 nft/ovs，並主動把 `.fw` 對應那行改成 `enable=0`（prepend `|`），
+同時在 `/var/log/pve-firewall.log` 寫一行 operator 可讀的事件 —— WebUI 的
+`VM → Firewall → Log` 分頁直接看得到。下一次使用者重新打勾、若問題沒修好會
+再次 quarantine；修好了就正常編譯通過。
+
+Quarantine 有兩個來源：
+
+**(A) 前端 compile-time rejection**：L3 家族驗證失敗（見 §5.5）、`@neo:rateexceed + ACCEPT`
+等不合理組合。Compiler 在 `compile_rejections: {source_id: reason}` 累積這些，
+apply 階段連同後端 rejection 一起 materialize。
+
+**(B) 後端 backend rejection**：`nft -f` 或 `ovs-ofctl add-flows` 失敗。apply 層
+有一個 retry loop：
+
+```
+quarantined = {}
+while True:
+    filtered_ir = filter_out(ir, quarantined.keys())
+    render → load
+    if ok: break
+    bad_id = parse_error(err)           # 見下
+    if bad_id is None:       raise      # parser 無法判定 → bail
+    if bad_id in quarantined: raise     # 同一 rule 再次報錯 → 防迴圈
+    quarantined[bad_id] = err
+```
+
+每個 IR rule 帶一個 `source_id = "vm<vmid>-line<N>"`（一條 .fw 規則展開多條 IR
+共用同一個 ID），backend 輸出時把它嵌進每條 rule：
+
+- **nft**：`... drop comment "vm<vmid>-line<N>"`。nft 失敗時 stderr 會印出問題行（含 comment），regex 撈出 `vm<N>-line<N>` 即可反查
+- **OVS**：`cookie=0x4E30<48-bit hash(source_id)>`。ovs-ofctl 錯誤格式固定是 `ovs-ofctl: <file>:<lineno>: <reason>`，對應回 flows 檔行號、取出 cookie、查 `cookie_map` 得到 source_id
+
+Retry loop 自然收斂：每輪要嘛成功、要嘛從 IR 移掉一條，總 rule 數有限（最壞情況
+整個 ruleset 空白還是合法）。收斂後 materialize：
+
+1. `writeback_fw_disable(vmid, line_num)`：讀 `.fw`、prepend `|`、digest CAS 再寫回。CAS
+   比對原始內容是否變過（使用者中途 edit 會 race）；變了就放棄寫回、當次 apply 該 rule
+   依然從 IR 排除，下次 apply 再試
+2. `log_quarantine(vmid, source_id, reason)`：append 到 `/var/log/pve-firewall.log`，格式
+   `<vmid> <seq> - <PVE-timestamp> [pvefw-neo] invalid rule #<pos> disabled, reason: <condensed>`，
+   其中 `#<pos>` 是 PVE `[RULES]` 段內的 0-based 索引（和 WebUI 顯示的 rule 編號一致）
+
+Daemon 的 no-op caching 要把 `ir_rs.compile_rejections` 納入判斷，否則前端 reject 的
+rule 因為「沒進 IR、nft_text 沒變」而被 skip apply，writeback 不會觸發。
 
 ---
 
@@ -1095,18 +1255,19 @@ silent stale state。
 │   ├── parser.py                          # .fw / @neo: tag 解析
 │   ├── macros.py                          # Firewall.pm macro 解析 + fallback
 │   ├── vmdevs.py                          # VM/CT device discovery
-│   ├── compiler.py                        # parser 輸出 → IR
+│   ├── compiler.py                        # parser 輸出 → IR (含前端 validator)
 │   ├── nftgen.py                          # IR → nftables (linux bridge)
-│   ├── ovsgen.py                          # IR → OVS flows
+│   ├── ovsgen.py                          # IR → OVS flows (+ OF1.3 meters)
+│   ├── quarantine.py                      # retry loop、error parser、.fw 寫回、firewall log
 │   ├── bridge.py                          # bridge isolation reconcile
 │   └── main.py                            # CLI + daemon loop
 ├── tests/
-│   ├── setup.sh
-│   ├── run_tests.sh                       # 36 個 nft 功能測試
-│   ├── run_isolation_tests.sh             # 12 個 isolation 測試
-│   └── teardown.sh
+│   ├── setup.sh                           # 起測試 VM/CT、配置 bridge/網段
+│   ├── test.sh                            # 跨 nft/OVS/quarantine 整合測試
+│   ├── lib.sh                             # 共用 helper
+│   └── clean.sh                           # 還原
 ├── install.sh / upgrade.sh / uninstall.sh
-└── DESIGN.md / README.md / README.zh_TW.md
+└── DESIGN.md / README.md / README.zh.md
 
 /usr/local/bin/pvefw-neo                  → symlink → /usr/local/lib/pvefw_neo/pvefw-neo
 /etc/systemd/system/pvefw-neo.service     → symlink → /usr/local/lib/pvefw_neo/pvefw-neo.service
@@ -1114,7 +1275,7 @@ silent stale state。
 /run/pvefw-neo/
 ├── ruleset.nft                           # 最近一次的 nftables 規則
 ├── ovs-<bridge>.flows                    # 最近一次的 OVS flows (per bridge)
-└── state.json                            # 套用狀態
+└── state.json                            # 套用狀態（含 quarantined source_ids 清單）
 ```
 
 ### 11.2 內部模組依賴
@@ -1124,7 +1285,10 @@ parser ──┐
          ├──> compiler ──> ir ──┬──> nftgen ──> nft -f
 macros ──┤                     │
          │                     └──> ovsgen ──> ovs-ofctl
-vmdevs ──┘
+vmdevs ──┘                           ↑
+                                     │
+quarantine: apply 層 retry loop + error parser + .fw writeback + firewall log
+            消費 ir + nftgen/ovsgen 的 cookie_map / comment 反查 source_id
 
 main: orchestration (CLI, daemon loop, backend dispatch)
 bridge: external — kernel bridge isolated flag reconcile
@@ -1149,7 +1313,7 @@ OVS bridge 完全用 OpenFlow 規則實作，不依賴 Linux netfilter。
   • 符合 → resubmit(,10)
    ↓
 [Table 10: Stateless filter]
-  • per in_port, ipspoof / nodhcp / nora / @neo:notrack ACL
+  • per in_port, ipspoof / nodhcp / nora / @neo:noct ACL
   • drop 或 resubmit(,20)
    ↓
 [Table 20: Conntrack send]
@@ -1185,9 +1349,40 @@ OVS bridge 完全用 OpenFlow 規則實作，不依賴 Linux netfilter。
 
 OVS ofport 在 VM stop/start 時會重新分配，舊 flow 變成 dangling。daemon 用 10 秒 polling 偵測這個情況（見 §10.2）。
 
-### Cookie
+### Cookie 與 Meter ID 佈局
 
-所有 pvefw-neo 安裝的 flow 帶 `cookie=0x4E30`（"NE0" 編碼），以便用 `del-flows cookie=0x4E30/-1` 一次清除自己的 flow，不影響其他控制器的 flow。
+為了支援「錯誤時反查到對應 source rule」和「per-pvefw-neo ownership 辨識」，
+flow cookie 和 meter ID 都用 prefix-based scheme：
+
+| 欄位 | 長度 | 佈局 |
+|---|---|---|
+| Flow cookie | 64-bit | 高 16 bit = `0x4E30` (magic) \| 低 48 bit = `sha256(source_id)[:6]`（framework flow 留 0） |
+| Meter ID | 32-bit | 高 16 bit = `0x4E30` (magic) \| 低 16 bit = `sha256(source_id)[:2]` |
+
+Apply 前先用 `del-flows cookie=0x4E30000000000000/0xFFFF000000000000` 清掉所有
+我們擁有的 flow（不影響其他 controller）；meter 類似用 `dump-meters` + prefix
+過濾 + `del-meter` 逐個清。
+
+反查方向（quarantine error parser 用）：
+1. 從 ovs-ofctl stderr 抓 `<file>:<line>:`
+2. 讀 flows 檔第 `<line>` 行
+3. `cookie=0x...` → 轉 int → `self._cookie_to_source` dict 查回 source_id
+
+### OF1.3 Meter（@neo:mcast_limit / @neo:rateexceed）
+
+OVS backend 把 rate-limit 實作成 OF1.3 meter：
+
+```
+meter=<id>,pktps,burst,bands=type=drop rate=<pps> burst_size=5
+```
+
+flow 使用 `actions=meter:<id>,resubmit(,10)`：在 rate 之內 meter pass through → 下一階段；超過
+rate → band 的 drop 動作丟封包。
+
+Meter 需要 OF1.3，bridge 的 `protocols` 預設可能只有 OF1.0。pvefw-neo 在需要 meter
+時會自動把 `OpenFlow13` 加進該 bridge 的 protocols 清單（additive、不影響既有 flow）。
+
+沒用 meter 的 bridge 完全走 OF1.0 路徑，不改動現狀。
 
 ---
 
@@ -1195,10 +1390,13 @@ OVS ofport 在 VM stop/start 時會重新分配，舊 flow 變成 dangling。dae
 
 | 限制 | 原因 | 影響 |
 |------|------|------|
-| REJECT → DROP | bridge family 不支援 reject | 對方只能 timeout |
+| `REJECT` → `DROP` | nftables bridge family 與 OVS 都不支援 REJECT | 對方只能 timeout |
 | bridge conntrack ≥ kernel 5.3 | nftables 限制 | PVE 7+ 滿足 |
-| Finger macro 佔用 | dummy rule 載體 | TCP/79 無人使用 |
-| comment 欄位長度 | PVE WebUI 限制 | 複雜規則拆多條 |
+| `Finger` macro 保留為 sugar carrier | TCP/79 無人使用 | — |
+| comment 欄位長度上限 | PVE WebUI 限制 | 複雜規則需拆多條 |
+| OVS isolation 需 ≥ 2 isolated ports | 語意 A：「兩個 isolated 互不通」 | 單一 isolated port 無意義 |
+| `@neo:rateexceed` 僅限 `@neo:noct` + `DROP` | stateful + rate limit 語意不乾淨；OVS meter 只支援 drop band | 見 §5.3 |
+| OVS ipset 展開為 CIDR 減法 | OVS 沒有 named set 概念 | 大 ipset 編譯時間拉長 |
 
 ---
 
@@ -1221,7 +1419,7 @@ OVS ofport 在 VM stop/start 時會重新分配，舊 flow 變成 dangling。dae
 |------|------------------------|-----------|
 | 後端 | nftables only | nftables + OVS |
 | Per-port rules | ❌ per-VM | ✅ per-port (per vNIC) |
-| NOTRACK | ❌ 全 conntrack | ✅ per-rule (`@neo:notrack`) |
+| NOTRACK | ❌ 全 conntrack | ✅ per-rule (`@neo:noct`) |
 | 非對稱路由 | ❌ conntrack drop invalid | ✅ STATELESS rules 繞過 ct |
 | Multicast ratelimit | ❌ | ✅ `@neo:mcast_limit` |
 | Port isolation | ❌ | ✅ `@neo:isolated` (語意 A) |
@@ -1232,39 +1430,24 @@ OVS ofport 在 VM stop/start 時會重新分配，舊 flow 變成 dangling。dae
 
 ---
 
-## 14. 實作狀態
+## 14. 測試
 
-### Phase 1：核心 ✅
-- [x] `parser.py`：.fw 解析 + @neo: tag 解析 + ALIASES + IPSET + GROUP
-- [x] `macros.py`：Firewall.pm runtime 解析 + hardcoded fallback
-- [x] `vmdevs.py`：VM/CT device discovery（tap/veth, MAC, bridge）
-- [x] `compiler.py`：parser → IR
-- [x] `ir.py`：後端無關中間表示
-- [x] `nftgen.py`：IR → nftables (linux bridge)
-- [x] `main.py`：CLI `--dry-run` / `--apply` / `--dump-ir`
+整合測試放在 `tests/`：
 
-### Phase 2：daemon + sugar ✅
-- [x] Sugar tag 展開：`@neo:macspoof`, `ipspoof`, `nodhcp`, `nora`, `nondp`
-- [x] inotify watch (`/etc/pve/firewall/`, `/etc/pve/{qemu-server,lxc}/`)
-- [x] 2 秒 debounce
-- [x] systemd service + preflight check
-- [x] `--apply` 自動 backend dispatch
+- `tests/setup.sh`：起一對 VM / CT，設好多 bridge / 多網段 slot
+- `tests/test.sh`：透過 `pvesh` 建 rule（走跟 WebUI 一樣的 API），再用
+  `qemu-guest-agent` / `pct exec` 做 packet-level 驗證
+- `tests/clean.sh`：還原環境
 
-### Phase 3：進階 ✅
-- [x] `@neo:mcast_limit` (netdev ingress rate limit)
-- [x] `@neo:isolated` (kernel `bridge link isolated`)
-- [x] alias / ipset / security group 完整支援
-- [x] OVS backend (`ovsgen.py`)
-- [x] OVS port topology polling (10 秒)
-- [x] `@neo:isolated` 在 OVS 用 reg0 mark + dl_dst drop 模擬
+涵蓋的場景：
 
-### 測試覆蓋
+| 範疇 | 說明 |
+|------|------|
+| Extension rules | macspoof / ipspoof / nodhcp / nora / nondp / mcast_limit / isolated / disable |
+| Decorators | stateless、srcmac (in/bitmask)、dstmac、vlan、rateexceed |
+| Cross-feature | macspoof + ipspoof 組合、單獨啟用時不誤擋 |
+| PVE native | ICMP、SSH macro、ipset match+nomatch、cluster alias |
+| OVS parity | 同樣場景在 OVS bridge 上跑一遍 |
+| Quarantine | OVS icmp family 衝突、nft ipset 家族衝突、使用者修好再 apply 會恢復 |
 
-| 測試套件 | 數量 | 狀態 |
-|---------|------|------|
-| nft functional + structural | 36 | ✅ all pass |
-| OVS functional | 4 | ✅ all pass |
-| Isolation (Linux + OVS) | 12 | ✅ all pass |
-| **總計** | **52** | |
-
-測試腳本：`tests/run_tests.sh`, `tests/run_isolation_tests.sh`
+開發期在 pvefw-neo 主機上 `bash tests/setup.sh && bash tests/test.sh` 即可全跑一次。

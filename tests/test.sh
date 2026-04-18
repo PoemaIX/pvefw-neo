@@ -69,14 +69,14 @@ test_macspoof_linux() {
     # Set a rule that allows only the VM's real MAC (no args = auto-read)
     local iface; iface=$(slot_iface linux 1)
     fw_enable vm ACCEPT ACCEPT
-    fw_rule_disabled vm DROP out --macro Finger --iface "$iface" --comment "@neo:macspoof"
+    fw_rule_extension vm DROP out --macro Finger --iface "$iface" --comment "@neo:macspoof"
     fw_apply
     check "macspoof: legitimate VM→CT ping passes"     "PASS" "$(probe_ping linux 1)"
 
     # Now inject an additional allowed MAC list that does NOT include the VM's
     # real MAC (only two bogus MACs) → all traffic from this iface should drop.
     fw_clear vm
-    fw_rule_disabled vm DROP out --macro Finger --iface "$iface" \
+    fw_rule_extension vm DROP out --macro Finger --iface "$iface" \
         --comment "@neo:macspoof aa:bb:cc:dd:ee:ff,aa:bb:cc:dd:ee:00"
     fw_apply
     check "macspoof: forged src MAC → dropped"         "FAIL" "$(probe_ping linux 1)"
@@ -92,14 +92,14 @@ test_ipspoof_linux() {
 
     fw_enable vm ACCEPT ACCEPT
     # Put the VM's legit source IP in Source — @neo:ipspoof reads from there.
-    fw_rule_disabled vm DROP out --macro Finger --iface "$iface" \
+    fw_rule_extension vm DROP out --macro Finger --iface "$iface" \
         --source "$vm_ip" --comment "@neo:ipspoof"
     fw_apply
     check "ipspoof: legit src IP passes"  "PASS" "$(probe_ping linux 1)"
 
     # Rule that only allows an unrelated IP → VM's real traffic drops.
     fw_clear vm
-    fw_rule_disabled vm DROP out --macro Finger --iface "$iface" \
+    fw_rule_extension vm DROP out --macro Finger --iface "$iface" \
         --source "198.51.100.42/32" --comment "@neo:ipspoof"
     fw_apply
     check "ipspoof: unlisted src IP → dropped" "FAIL" "$(probe_ping linux 1)"
@@ -112,7 +112,7 @@ test_nodhcp_linux() {
     iface=$(slot_iface linux 1)
     ct_ip=$(slot_ip linux 1 $CT_HOST_OCTET)
     fw_enable vm ACCEPT ACCEPT
-    fw_rule_disabled vm DROP out --macro Finger --iface "$iface" --comment "@neo:nodhcp"
+    fw_rule_extension vm DROP out --macro Finger --iface "$iface" --comment "@neo:nodhcp"
     fw_apply
     # Regular traffic still works
     check "nodhcp: normal traffic unaffected" "PASS" "$(probe_ping linux 1)"
@@ -127,7 +127,7 @@ test_nodhcp_linux() {
 test_nora_linux() {
     local iface; iface=$(slot_iface linux 1)
     fw_enable vm ACCEPT ACCEPT
-    fw_rule_disabled vm DROP out --macro Finger --iface "$iface" --comment "@neo:nora"
+    fw_rule_extension vm DROP out --macro Finger --iface "$iface" --comment "@neo:nora"
     fw_apply
     # Structural: an RA-drop rule should be present in the netdev/raw chain
     local got
@@ -143,7 +143,7 @@ test_nora_linux() {
 test_nondp_linux() {
     local iface; iface=$(slot_iface linux 1)
     fw_enable vm ACCEPT ACCEPT
-    fw_rule_disabled vm DROP out --macro Finger --iface "$iface" --comment "@neo:nondp"
+    fw_rule_extension vm DROP out --macro Finger --iface "$iface" --comment "@neo:nondp"
     fw_apply
     local got
     got=$(nft list ruleset 2>/dev/null | grep -c "nd-neighbor-solicit.*nd-neighbor-advert")
@@ -156,7 +156,7 @@ test_nondp_linux() {
 test_mcast_limit_linux() {
     local iface; iface=$(slot_iface linux 1)
     fw_enable vm ACCEPT ACCEPT
-    fw_rule_disabled vm DROP out --macro Finger --iface "$iface" \
+    fw_rule_extension vm DROP out --macro Finger --iface "$iface" \
         --comment "@neo:mcast_limit 100"
     fw_apply
     # Structural: expect a limit rule with multicast mac mask
@@ -178,7 +178,7 @@ test_isolated_linux() {
     if1=$(slot_iface linux 1)
     if2=$(slot_iface linux 2)
     fw_enable vm ACCEPT ACCEPT
-    fw_rule_disabled vm DROP out --macro Finger --iface "$if1" --comment "@neo:isolated"
+    fw_rule_extension vm DROP out --macro Finger --iface "$if1" --comment "@neo:isolated"
     fw_apply
     # Structural check: bridge port for VM net1 (= tap<VMID>i1) should be marked
     # `isolated on` after pvefw-neo applies @neo:isolated.
@@ -253,7 +253,7 @@ test_cross_ipspoof_only_mac_forge() {
     ct_ip=$(slot_ip linux 1 $CT_HOST_OCTET)
 
     fw_enable vm ACCEPT ACCEPT
-    fw_rule_disabled vm DROP out --macro Finger --iface "$iface_vm" \
+    fw_rule_extension vm DROP out --macro Finger --iface "$iface_vm" \
         --source "$vm_ip" --comment "@neo:ipspoof"
     fw_apply
 
@@ -289,7 +289,7 @@ test_cross_macspoof_only_ip_forge() {
     fake_src="$(slot_subnet linux 1).99"
 
     fw_enable vm ACCEPT ACCEPT
-    fw_rule_disabled vm DROP out --macro Finger --iface "$iface_vm" \
+    fw_rule_extension vm DROP out --macro Finger --iface "$iface_vm" \
         --comment "@neo:macspoof"
     fw_apply
 
@@ -317,8 +317,8 @@ test_spoof_combo_linux() {
     iface=$(slot_iface linux 1)
     vm_ip=$(slot_ip linux 1 $VM_HOST_OCTET)
     fw_enable vm ACCEPT ACCEPT
-    fw_rule_disabled vm DROP out --macro Finger --iface "$iface" --comment "@neo:macspoof"
-    fw_rule_disabled vm DROP out --macro Finger --iface "$iface" \
+    fw_rule_extension vm DROP out --macro Finger --iface "$iface" --comment "@neo:macspoof"
+    fw_rule_extension vm DROP out --macro Finger --iface "$iface" \
         --source "$vm_ip" --comment "@neo:ipspoof"
     fw_apply
     check "macspoof+ipspoof: legit traffic passes" "PASS" "$(probe_ping linux 1)"
@@ -337,7 +337,7 @@ test_disable_linux() {
     check "policy_out DROP: outbound dropped" "FAIL" "$(probe_ping linux 1)"
 
     # @neo:disable → pvefw-neo skips the port entirely, policy doesn't apply
-    fw_rule_disabled vm DROP out --macro Finger --iface "$iface" --comment "@neo:disable"
+    fw_rule_extension vm DROP out --macro Finger --iface "$iface" --comment "@neo:disable"
     fw_apply
     check "disable: traffic flows through untouched" "PASS" "$(probe_ping linux 1)"
 }
@@ -460,8 +460,8 @@ test_spoof_combo_ovs() {
     iface=$(slot_iface ovs 1)
     vm_ip=$(slot_ip ovs 1 $VM_HOST_OCTET)
     fw_enable vm ACCEPT ACCEPT
-    fw_rule_disabled vm DROP out --macro Finger --iface "$iface" --comment "@neo:macspoof"
-    fw_rule_disabled vm DROP out --macro Finger --iface "$iface" \
+    fw_rule_extension vm DROP out --macro Finger --iface "$iface" --comment "@neo:macspoof"
+    fw_rule_extension vm DROP out --macro Finger --iface "$iface" \
         --source "$vm_ip" --comment "@neo:ipspoof"
     fw_apply
     check "OVS macspoof+ipspoof: legit traffic passes" "PASS" "$(probe_ping ovs 1)"
@@ -492,6 +492,76 @@ test_ipset_nomatch_ovs() {
     fw_rule vm ACCEPT in --iface "$iface" --proto icmp --source "+tst_ovs_set"
     fw_apply
     check "OVS ipset match+nomatch: CT excluded" "FAIL" "$(probe_ping_rev ovs 1)"
+}
+
+# ─────────────── 14. Quarantine: OVS rejects ether/proto family mismatch ───────────────
+#
+# Rule forces ether_type=ip but proto/icmp-type require ipv6. ovs-ofctl
+# must reject with "icmpv6_type requires ipv6"; quarantine flips the
+# rule's enable=1→0 in .fw and writes a firewall-log entry. Baseline
+# traffic on the same bridge stays unaffected.
+test_quarantine_ovs_icmp_family() {
+    local iface; iface=$(slot_iface ovs 1)
+    fw_enable vm ACCEPT ACCEPT
+    # Bottom rule first (pvesh prepends), so the bad rule ends up at pos 0.
+    fw_rule vm DROP out --iface "$iface" --proto icmpv6 \
+        --icmp-type echo-request --comment "@neo:noct @neo:ether ip"
+    fw_apply
+
+    check "OVS ether/proto quarantine: rule #0 auto-disabled" \
+          "0" "$(fw_rule_enabled vm 0)"
+    check "OVS ether/proto quarantine: log entry present" \
+          "YES" "$(fw_log_has_quarantine vm 0)"
+    check "OVS ether/proto quarantine: baseline ping on same bridge intact" \
+          "PASS" "$(probe_ping ovs 1)"
+}
+
+# ─────────────── 15. Quarantine: nft rejects ipset family mismatch ───────────────
+#
+# An ipv6-only ipset referenced from a rule forced to ether_type=ip yields
+# `ether type ip ip saddr @v6set_...` — nft refuses at load time with a
+# datatype mismatch. Same observable outcome as OVS test: rule disabled +
+# log entry.
+test_quarantine_nft_set_family() {
+    local iface; iface=$(slot_iface linux 1)
+    guest_ipset_create vm tst_qnft_v6
+    guest_ipset_add    vm tst_qnft_v6 "2001:db8::/64"
+    fw_enable vm ACCEPT ACCEPT
+    # @neo:noct + @neo:ether ip forces ether=ipv4, but set is ipv6-only.
+    fw_rule vm DROP out --iface "$iface" --source "+tst_qnft_v6" \
+        --comment "@neo:noct @neo:ether ip"
+    fw_apply
+
+    check "nft set-family quarantine: rule #0 auto-disabled" \
+          "0" "$(fw_rule_enabled vm 0)"
+    check "nft set-family quarantine: log entry present" \
+          "YES" "$(fw_log_has_quarantine vm 0)"
+    check "nft set-family quarantine: baseline ping on same bridge intact" \
+          "PASS" "$(probe_ping linux 1)"
+}
+
+# ─────────────── 16. Quarantine: self-heal after user fixes + re-enables ───────────────
+#
+# After quarantine disables the rule, the user fixes the contradiction
+# (removes @neo:ether ip) and re-enables. Next apply should leave the
+# rule enabled and no new quarantine log entry should appear for it.
+test_quarantine_self_heal() {
+    local iface; iface=$(slot_iface ovs 1)
+    fw_enable vm ACCEPT ACCEPT
+    fw_rule vm DROP out --iface "$iface" --proto icmpv6 \
+        --icmp-type echo-request --comment "@neo:noct @neo:ether ip"
+    fw_apply
+    check "self-heal prep: quarantine fired" "0" "$(fw_rule_enabled vm 0)"
+
+    # User repairs: drop the contradictory ether tag, put it back to @neo:noct
+    # only, and re-enable. Delete + re-add is cleanest via pvesh.
+    pvesh delete "$(vm_fw_base)/rules/0" >/dev/null
+    fw_rule vm DROP out --iface "$iface" --proto icmpv6 \
+        --icmp-type echo-request --comment "@neo:noct"
+    fw_apply
+
+    check "self-heal: rule stays enabled after fix" \
+          "1" "$(fw_rule_enabled vm 0)"
 }
 
 # ─────────────── Main ───────────────
@@ -544,6 +614,11 @@ run_test "Native:cluster ipset mix"    test_native_complex_ipset_linux
 run_test "OVS:basic ICMP"             test_native_basic_ovs
 run_test "OVS:macspoof+ipspoof"       test_spoof_combo_ovs
 run_test "OVS:ipset match+nomatch"    test_ipset_nomatch_ovs
+
+# ─── Pass 4: quarantine (bad rules auto-disabled + firewall log) ───
+run_test "Quarantine:OVS icmp family" test_quarantine_ovs_icmp_family
+run_test "Quarantine:nft set family"  test_quarantine_nft_set_family
+run_test "Quarantine:self-heal"       test_quarantine_self_heal
 
 # Final reset so the env ends clean
 fw_full_reset
