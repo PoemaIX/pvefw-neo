@@ -23,6 +23,11 @@
     2. ipspoof : 只允許特定 src ip ，阻止 ip 偽造
     3. nodhcp : 阻止 DHCP server
     4. nora : 阻止發送 RA
+5. **pvefw-neo 不使用 PVE 的任何 VM 級開關**
+   （`policy_in` / `policy_out` / `dhcp` / `macfilter` / `ipfilter` / `ndp` / `radv`）。
+   只認 VM 的 `enable` 切換。對應語意全部下放到 per-port `@neo:` tag，也正是
+   第 4 點能成立的基礎。想要某張 NIC 預設 drop？在那條 iface 的 rule 尾端
+   自己加一條 `IN DROP -i netN` catch-all。
 ---
 
 目前有以下限制:

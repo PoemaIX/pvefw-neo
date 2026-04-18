@@ -138,9 +138,6 @@ class Compiler:
             # warn-skipped firewall=1 ports are inert.
             self._compile_vm(vmid, config, nets, is_ct)
 
-            # Translate policy_in / policy_out to explicit catch-all rules
-            self._add_policy_catchalls(vmid, config, nets, is_ct)
-
         return ir.Ruleset(netdevs=self.netdevs, sets=self.sets,
                           compile_rejections=self.compile_rejections)
 
@@ -168,37 +165,6 @@ class Compiler:
                 self._expand_notrack(vmid, config, nets, is_ct, rule)
             else:
                 self._expand_stateful(vmid, config, nets, is_ct, rule)
-
-    def _add_policy_catchalls(self, vmid, config, nets, is_ct):
-        """Translate [OPTIONS] policy_in/out to explicit catch-all rules."""
-        pol_in = config.options.policy_in.upper()
-        pol_out = config.options.policy_out.upper()
-
-        for iface_name, net_info in nets.items():
-            devname = vmdevs.get_device_name(vmid, net_info["id"], is_ct)
-            nd = self.netdevs.get(devname)
-            if nd is None:
-                continue
-
-            # IN catch-all if not ACCEPT
-            if pol_in != "ACCEPT":
-                nd.rules.append(ir.Rule(
-                    direction=ir.Direction.IN,
-                    phase=ir.Phase.STATEFUL,
-                    match={},
-                    action="drop",
-                    comment=f"policy_in {pol_in}",
-                ))
-
-            # OUT catch-all if not ACCEPT
-            if pol_out != "ACCEPT":
-                nd.rules.append(ir.Rule(
-                    direction=ir.Direction.OUT,
-                    phase=ir.Phase.STATEFUL,
-                    match={},
-                    action="drop",
-                    comment=f"policy_out {pol_out}",
-                ))
 
     # ═══════════════════════════════════════
     # iface → devname helpers

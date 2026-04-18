@@ -67,16 +67,20 @@ class FwRule:
 
 
 class FwOptions:
-    """Parsed [OPTIONS] section."""
+    """Parsed [OPTIONS] section.
+
+    pvefw-neo deliberately does NOT use PVE's VM-level toggles
+    (dhcp, macfilter, ipfilter, ndp, radv, policy_in, policy_out) —
+    everything that was once per-VM now lives per-port as @neo: tags
+    on the corresponding rule/sugar. The only VM-level knob we honor
+    is `enable`, which switches the whole VM's rules on/off.
+
+    `log_level_in` / `log_level_out` are kept for future use (VM-level
+    default log level); per-rule `-log <level>` is the authoritative
+    source today.
+    """
     def __init__(self):
         self.enable = False
-        self.policy_in = "DROP"
-        self.policy_out = "ACCEPT"
-        self.dhcp = None
-        self.macfilter = None
-        self.ipfilter = None
-        self.ndp = None
-        self.radv = None
         self.log_level_in = None
         self.log_level_out = None
 
@@ -329,7 +333,16 @@ def parse_fw_file(path):
 
 
 def _parse_option_line(options, line):
-    """Parse an OPTIONS section line."""
+    """Parse an OPTIONS section line.
+
+    Recognised keys: `enable`, `log_level_in`, `log_level_out`.
+    Other PVE native keys (policy_in / policy_out / dhcp / macfilter /
+    ipfilter / ndp / radv) are parsed-as-known-unknowns — silently
+    ignored here. Equivalent functionality in pvefw-neo is per-port
+    via @neo: tags (see @neo:nodhcp, @neo:nora, @neo:nondp,
+    @neo:macspoof, @neo:ipspoof, or a plain OUT DROP catch-all rule
+    on a specific iface in place of policy_out).
+    """
     m = re.match(r'^(\w+)\s*[:=]\s*(.+)$', line)
     if not m:
         return
@@ -339,20 +352,6 @@ def _parse_option_line(options, line):
 
     if key == "enable":
         options.enable = val == "1"
-    elif key == "policy_in":
-        options.policy_in = val.upper()
-    elif key == "policy_out":
-        options.policy_out = val.upper()
-    elif key == "dhcp":
-        options.dhcp = val == "1"
-    elif key == "macfilter":
-        options.macfilter = val == "1"
-    elif key == "ipfilter":
-        options.ipfilter = val == "1"
-    elif key == "ndp":
-        options.ndp = val == "1"
-    elif key == "radv":
-        options.radv = val == "1"
     elif key == "log_level_in":
         options.log_level_in = val
     elif key == "log_level_out":

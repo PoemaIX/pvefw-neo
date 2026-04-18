@@ -68,7 +68,7 @@ baseline() {
 test_macspoof_linux() {
     # Set a rule that allows only the VM's real MAC (no args = auto-read)
     local iface; iface=$(slot_iface linux 1)
-    fw_enable vm ACCEPT ACCEPT
+    fw_enable vm
     fw_rule_extension vm DROP out --macro Finger --iface "$iface" --comment "@neo:macspoof"
     fw_apply
     check "macspoof: legitimate VM→CT ping passes"     "PASS" "$(probe_ping linux 1)"
@@ -90,7 +90,7 @@ test_ipspoof_linux() {
     vm_ip=$(slot_ip linux 1 $VM_HOST_OCTET)
     ct_ip=$(slot_ip linux 1 $CT_HOST_OCTET)
 
-    fw_enable vm ACCEPT ACCEPT
+    fw_enable vm
     # Put the VM's legit source IP in Source — @neo:ipspoof reads from there.
     fw_rule_extension vm DROP out --macro Finger --iface "$iface" \
         --source "$vm_ip" --comment "@neo:ipspoof"
@@ -111,7 +111,7 @@ test_nodhcp_linux() {
     local iface ct_ip
     iface=$(slot_iface linux 1)
     ct_ip=$(slot_ip linux 1 $CT_HOST_OCTET)
-    fw_enable vm ACCEPT ACCEPT
+    fw_enable vm
     fw_rule_extension vm DROP out --macro Finger --iface "$iface" --comment "@neo:nodhcp"
     fw_apply
     # Regular traffic still works
@@ -126,7 +126,7 @@ test_nodhcp_linux() {
 
 test_nora_linux() {
     local iface; iface=$(slot_iface linux 1)
-    fw_enable vm ACCEPT ACCEPT
+    fw_enable vm
     fw_rule_extension vm DROP out --macro Finger --iface "$iface" --comment "@neo:nora"
     fw_apply
     # Structural: an RA-drop rule should be present in the netdev/raw chain
@@ -142,7 +142,7 @@ test_nora_linux() {
 
 test_nondp_linux() {
     local iface; iface=$(slot_iface linux 1)
-    fw_enable vm ACCEPT ACCEPT
+    fw_enable vm
     fw_rule_extension vm DROP out --macro Finger --iface "$iface" --comment "@neo:nondp"
     fw_apply
     local got
@@ -155,7 +155,7 @@ test_nondp_linux() {
 
 test_mcast_limit_linux() {
     local iface; iface=$(slot_iface linux 1)
-    fw_enable vm ACCEPT ACCEPT
+    fw_enable vm
     fw_rule_extension vm DROP out --macro Finger --iface "$iface" \
         --comment "@neo:mcast_limit 100"
     fw_apply
@@ -177,7 +177,7 @@ test_isolated_linux() {
     local if1 if2
     if1=$(slot_iface linux 1)
     if2=$(slot_iface linux 2)
-    fw_enable vm ACCEPT ACCEPT
+    fw_enable vm
     fw_rule_extension vm DROP out --macro Finger --iface "$if1" --comment "@neo:isolated"
     fw_apply
     # Structural check: bridge port for VM net1 (= tap<VMID>i1) should be marked
@@ -191,7 +191,7 @@ test_isolated_linux() {
 
 test_srcmac_bitmask_linux() {
     local iface; iface=$(slot_iface linux 1)
-    fw_enable vm ACCEPT ACCEPT
+    fw_enable vm
     # bitmask 00:00:00:00:00:00 never matches → rule inert, traffic passes
     fw_rule vm DROP out --iface "$iface" \
         --comment "@neo:noct @neo:srcmac bitmask 00:00:00:00:00:00"
@@ -206,7 +206,7 @@ test_srcmac_bitmask_linux() {
 
 test_dstmac_linux() {
     local iface; iface=$(slot_iface linux 1)
-    fw_enable vm ACCEPT ACCEPT
+    fw_enable vm
     fw_rule vm DROP out --iface "$iface" \
         --comment "@neo:noct @neo:dstmac in ff:ff:ff:ff:ff:ff"
     fw_apply
@@ -220,7 +220,7 @@ test_dstmac_linux() {
 
 test_vlan_linux() {
     local iface; iface=$(slot_iface linux 1)
-    fw_enable vm ACCEPT ACCEPT
+    fw_enable vm
     fw_rule vm ACCEPT out --iface "$iface" --comment "@neo:noct @neo:vlan 20"
     fw_apply
     local got
@@ -233,7 +233,7 @@ test_vlan_linux() {
 
 test_rateexceed_linux() {
     local iface; iface=$(slot_iface linux 1)
-    fw_enable vm ACCEPT ACCEPT
+    fw_enable vm
     fw_rule vm DROP out --iface "$iface" \
         --comment "@neo:noct @neo:rateexceed 50"
     fw_apply
@@ -252,7 +252,7 @@ test_cross_ipspoof_only_mac_forge() {
     vm_ip=$(slot_ip linux 1 $VM_HOST_OCTET)
     ct_ip=$(slot_ip linux 1 $CT_HOST_OCTET)
 
-    fw_enable vm ACCEPT ACCEPT
+    fw_enable vm
     fw_rule_extension vm DROP out --macro Finger --iface "$iface_vm" \
         --source "$vm_ip" --comment "@neo:ipspoof"
     fw_apply
@@ -288,7 +288,7 @@ test_cross_macspoof_only_ip_forge() {
     # Fake src inside same /24 to avoid CT-side rp_filter dropping it.
     fake_src="$(slot_subnet linux 1).99"
 
-    fw_enable vm ACCEPT ACCEPT
+    fw_enable vm
     fw_rule_extension vm DROP out --macro Finger --iface "$iface_vm" \
         --comment "@neo:macspoof"
     fw_apply
@@ -316,7 +316,7 @@ test_spoof_combo_linux() {
     local iface vm_ip
     iface=$(slot_iface linux 1)
     vm_ip=$(slot_ip linux 1 $VM_HOST_OCTET)
-    fw_enable vm ACCEPT ACCEPT
+    fw_enable vm
     fw_rule_extension vm DROP out --macro Finger --iface "$iface" --comment "@neo:macspoof"
     fw_rule_extension vm DROP out --macro Finger --iface "$iface" \
         --source "$vm_ip" --comment "@neo:ipspoof"
@@ -328,15 +328,14 @@ test_spoof_combo_linux() {
 
 test_disable_linux() {
     local iface; iface=$(slot_iface linux 1)
-    # Use policy_out DROP: new VM-initiated outbound is dropped. (We can't
-    # use policy_in DROP here because the forward chain has a catch-all
-    # `ct state established,related accept` in front of per-iface chains,
-    # so replies to VM-initiated traffic always pass regardless of policy_in.)
-    fw_enable vm ACCEPT DROP
+    # Per-iface OUT catch-all DROP replaces the old policy_out DROP baseline
+    # (pvefw-neo no longer reads VM-level policies — per-port is the only way).
+    fw_enable vm
+    fw_rule vm DROP out --iface "$iface"
     fw_apply
-    check "policy_out DROP: outbound dropped" "FAIL" "$(probe_ping linux 1)"
+    check "per-iface OUT DROP: outbound dropped" "FAIL" "$(probe_ping linux 1)"
 
-    # @neo:disable → pvefw-neo skips the port entirely, policy doesn't apply
+    # @neo:disable → pvefw-neo skips the port entirely, catch-all doesn't apply
     fw_rule_extension vm DROP out --macro Finger --iface "$iface" --comment "@neo:disable"
     fw_apply
     check "disable: traffic flows through untouched" "PASS" "$(probe_ping linux 1)"
@@ -350,7 +349,7 @@ test_stateless_srcmac_linux() {
     vm_mac=$(qm config "$VMID_VM" | awk -v n="net1" '$1==n":"{print $0}' \
               | grep -oE '[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}' | head -1)
 
-    fw_enable vm ACCEPT ACCEPT
+    fw_enable vm
     # pvesh prepends: create bottom-up so final order is ACCEPT (pos 0) then DROP.
     fw_rule vm DROP out --iface "$iface" --comment "@neo:noct"
     fw_rule vm ACCEPT out --iface "$iface" \
@@ -363,7 +362,8 @@ test_stateless_srcmac_linux() {
 
 test_native_basic_linux() {
     local iface; iface=$(slot_iface linux 1)
-    fw_enable vm DROP ACCEPT
+    fw_enable vm
+    fw_rule vm DROP in --iface "$iface"   # catch-all; allow rules prepend above
     fw_rule vm ACCEPT in --iface "$iface" --proto icmp
     fw_apply
     # CT→VM ping: creates a NEW flow into VM, exercises IN chain.
@@ -376,7 +376,8 @@ test_native_ssh_macro_linux() {
     local iface; iface=$(slot_iface linux 1)
     # listener inside VM, probe from CT side. We flip direction for variety.
     start_listener vm 22
-    fw_enable vm DROP ACCEPT
+    fw_enable vm
+    fw_rule vm DROP in --iface "$iface"   # catch-all; allow rules prepend above
     fw_rule vm ACCEPT in --iface "$iface" --macro SSH
     fw_apply
     local ct_vm_ip; ct_vm_ip=$(slot_ip linux 1 $VM_HOST_OCTET)
@@ -399,7 +400,8 @@ test_native_ipset_match_nomatch_linux() {
     guest_ipset_add    vm tst_whitelist "$ct_subnet"
     guest_ipset_add    vm tst_whitelist "$ct_ip" 1     # nomatch
 
-    fw_enable vm DROP ACCEPT
+    fw_enable vm
+    fw_rule vm DROP in --iface "$iface"   # catch-all; allow rules prepend above
     fw_rule vm ACCEPT in --iface "$iface" --proto icmp --source "+tst_whitelist"
     fw_apply
     # CT→VM ping: CT is excluded from whitelist via nomatch → rule doesn't match → drop
@@ -416,7 +418,8 @@ test_native_cluster_alias_linux() {
     # Datacenter alias → VM-local rule references it via dc/<name>
     cluster_alias_create tst_peer "$ct_ip"
 
-    fw_enable vm DROP ACCEPT
+    fw_enable vm
+    fw_rule vm DROP in --iface "$iface"   # catch-all; allow rules prepend above
     fw_rule vm ACCEPT in --iface "$iface" --proto icmp --source "dc/tst_peer"
     fw_apply
     # CT→VM ping: rule allows src matching dc/tst_peer = CT's IP → passes
@@ -436,7 +439,8 @@ test_native_complex_ipset_linux() {
     # Positive: whole subnet; nomatch: alias-resolved CT
     cluster_ipset_add tst_dc_set "$ct_subnet"
     cluster_ipset_add tst_dc_set "$ct_ip" 1
-    fw_enable vm DROP ACCEPT
+    fw_enable vm
+    fw_rule vm DROP in --iface "$iface"   # catch-all; allow rules prepend above
     fw_rule vm ACCEPT in --iface "$iface" --proto icmp --source "+dc/tst_dc_set"
     fw_apply
     # CT→VM ping: CT excluded via nomatch → rule doesn't match → drop
@@ -447,7 +451,8 @@ test_native_complex_ipset_linux() {
 
 test_native_basic_ovs() {
     local iface; iface=$(slot_iface ovs 1)
-    fw_enable vm DROP ACCEPT
+    fw_enable vm
+    fw_rule vm DROP in --iface "$iface"   # catch-all; allow rules prepend above
     fw_rule vm ACCEPT in --iface "$iface" --proto icmp
     fw_apply
     check "OVS native IN ACCEPT icmp: CT→VM ping passes" "PASS" "$(probe_ping_rev ovs 1)"
@@ -459,7 +464,7 @@ test_spoof_combo_ovs() {
     local iface vm_ip
     iface=$(slot_iface ovs 1)
     vm_ip=$(slot_ip ovs 1 $VM_HOST_OCTET)
-    fw_enable vm ACCEPT ACCEPT
+    fw_enable vm
     fw_rule_extension vm DROP out --macro Finger --iface "$iface" --comment "@neo:macspoof"
     fw_rule_extension vm DROP out --macro Finger --iface "$iface" \
         --source "$vm_ip" --comment "@neo:ipspoof"
@@ -488,7 +493,8 @@ test_ipset_nomatch_ovs() {
     guest_ipset_create vm tst_ovs_set
     guest_ipset_add    vm tst_ovs_set "$ct_subnet"
     guest_ipset_add    vm tst_ovs_set "$ct_ip" 1
-    fw_enable vm DROP ACCEPT
+    fw_enable vm
+    fw_rule vm DROP in --iface "$iface"   # catch-all; allow rules prepend above
     fw_rule vm ACCEPT in --iface "$iface" --proto icmp --source "+tst_ovs_set"
     fw_apply
     check "OVS ipset match+nomatch: CT excluded" "FAIL" "$(probe_ping_rev ovs 1)"
@@ -502,7 +508,7 @@ test_ipset_nomatch_ovs() {
 # traffic on the same bridge stays unaffected.
 test_quarantine_ovs_icmp_family() {
     local iface; iface=$(slot_iface ovs 1)
-    fw_enable vm ACCEPT ACCEPT
+    fw_enable vm
     # Bottom rule first (pvesh prepends), so the bad rule ends up at pos 0.
     fw_rule vm DROP out --iface "$iface" --proto icmpv6 \
         --icmp-type echo-request --comment "@neo:noct @neo:ether ip"
@@ -526,7 +532,7 @@ test_quarantine_nft_set_family() {
     local iface; iface=$(slot_iface linux 1)
     guest_ipset_create vm tst_qnft_v6
     guest_ipset_add    vm tst_qnft_v6 "2001:db8::/64"
-    fw_enable vm ACCEPT ACCEPT
+    fw_enable vm
     # @neo:noct + @neo:ether ip forces ether=ipv4, but set is ipv6-only.
     fw_rule vm DROP out --iface "$iface" --source "+tst_qnft_v6" \
         --comment "@neo:noct @neo:ether ip"
@@ -547,7 +553,7 @@ test_quarantine_nft_set_family() {
 # rule enabled and no new quarantine log entry should appear for it.
 test_quarantine_self_heal() {
     local iface; iface=$(slot_iface ovs 1)
-    fw_enable vm ACCEPT ACCEPT
+    fw_enable vm
     fw_rule vm DROP out --iface "$iface" --proto icmpv6 \
         --icmp-type echo-request --comment "@neo:noct @neo:ether ip"
     fw_apply

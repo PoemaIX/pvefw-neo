@@ -23,6 +23,12 @@ Solves the following pain points:
     2. ipspoof: only allow specific src IP, prevent IP spoofing
     3. nodhcp: block DHCP server
     4. nora: block sending RA
+5. **pvefw-neo ignores every VM-level toggle PVE exposes**
+   (`policy_in` / `policy_out` / `dhcp` / `macfilter` / `ipfilter` / `ndp` / `radv`).
+   Only the VM `enable` switch is honored. Equivalent behaviour is per-port via
+   `@neo:` tags, which is what makes (4) possible in the first place. Want
+   default-drop on a specific NIC? Add an explicit `IN DROP -i netN` rule at the
+   end of that NIC's chain.
 ---
 
 Current limitations:

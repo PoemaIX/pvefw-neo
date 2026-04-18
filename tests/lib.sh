@@ -151,11 +151,15 @@ fw_clear() {
     done
 }
 
-# fw_enable <kind> [policy_in] [policy_out]
+# fw_enable <kind>
+# pvefw-neo only honors the `enable` switch at VM level — policy_in /
+# policy_out / dhcp / macfilter / etc. are deliberately ignored in
+# favour of per-port @neo: tags. Tests therefore don't bother setting
+# policies; for "drop by default" scenarios, add an explicit per-iface
+# catch-all rule via fw_rule.
 fw_enable() {
-    local kind=$1 pin=${2:-ACCEPT} pout=${3:-ACCEPT}
-    pvesh set "$(guest_fw_base $kind)/options" \
-        --enable 1 --policy_in "$pin" --policy_out "$pout" >/dev/null
+    local kind=$1
+    pvesh set "$(guest_fw_base $kind)/options" --enable 1 >/dev/null
 }
 
 fw_disable() {
