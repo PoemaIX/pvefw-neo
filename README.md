@@ -96,6 +96,41 @@ The daemon detects changes and re-applies within a few seconds.
 2. pvefw-neo provides two classes of extensions, both placed in the **comment field**
 of PVE rules, prefixed with `@neo:`
 
+### Rule scope and ordering
+
+**Interface field empty = applies to every NIC.** A rule without a value in the
+`Interface` column (i.e. no `-iface netN`) is fanned out to **every vNIC** the
+VM has. This is what makes a single rule stand in for the VM-level toggles that
+pvefw-neo deliberately ignores:
+
+| Old (PVE VM [OPTIONS])       | New (a single rule with no Interface)              |
+|------------------------------|----------------------------------------------------|
+| `policy_in: DROP`            | `IN DROP`                                          |
+| `policy_out: DROP`           | `OUT DROP`                                         |
+| `policy_in: REJECT`          | `IN DROP` (bridge family can't REJECT; see Limitations) |
+
+Want the catch-all on just one NIC? Add an `Interface` value and it stops
+fanning out:  `IN DROP -iface net1`.
+
+**Rules evaluate top-to-bottom.** PVE's WebUI `Add` inserts each new rule
+at the **top** (position 0), so the visible order from top to bottom is
+reverse-creation-order. Put catch-alls in first:
+
+1. Create the catch-all (`IN DROP`, no interface).
+2. Then create each specific `IN ACCEPT ...` rule.
+
+Resulting list:
+
+```
+pos 0  IN ACCEPT -p tcp -dport 22      ← last added, evaluates first
+pos 1  IN ACCEPT -p tcp -dport 443
+pos 2  IN ACCEPT -p icmp
+pos 3  IN DROP                         ← first added, evaluates last (catch-all)
+```
+
+Reverse the order and the catch-all drops everything before any ACCEPT gets
+the chance to match.
+
 ### Class 1 — Extension rules
 
 These rules provide functionality not available in PVE's native firewall.  

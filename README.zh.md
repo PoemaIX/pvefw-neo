@@ -94,6 +94,37 @@ daemon 會在數秒內偵測變動並重新套用。
 2. pvefw-neo 提供兩類擴充，都放在 PVE 規則的 **comment 欄位**
 中，統一以 `@neo:` 為前綴
 
+### 規則範圍與順序
+
+**Interface 欄位沒填 = 套用到該 VM 的每一張 NIC。** rule 沒指定
+`-iface netN` 時，compiler 把它 fan-out 到每一張 vNIC —— 這正是一條規則
+能取代那些被 pvefw-neo 忽略的 VM-level toggle 的機制：
+
+| 舊（PVE VM [OPTIONS]） | 新（一條 Interface 空著的 rule） |
+|---|---|
+| `policy_in: DROP`  | `IN DROP` |
+| `policy_out: DROP` | `OUT DROP` |
+| `policy_in: REJECT` | `IN DROP`（bridge family 不支援 REJECT，見「限制」） |
+
+只想對某張 NIC 下 catch-all？填 Interface 就行：`IN DROP -iface net1`，不再 fan-out。
+
+**規則由上往下評估。** PVE WebUI 的 `Add` 每次都把新規則插在**最頂端**
+（pos 0），所以看得到的順序是「後加的在上、先加的在下」。catch-all 要先建：
+
+1. 先建 catch-all（`IN DROP`，Interface 留空）
+2. 再一條一條加 `IN ACCEPT ...`
+
+最終列表：
+
+```
+pos 0  IN ACCEPT -p tcp -dport 22      ← 最後加的，最先評估
+pos 1  IN ACCEPT -p tcp -dport 443
+pos 2  IN ACCEPT -p icmp
+pos 3  IN DROP                         ← 最先加的，最後評估（catch-all）
+```
+
+順序反了 catch-all 會最先 match、全部 drop，後面的 ACCEPT 就永遠跑不到。
+
 ### 第一類 — Extension rules
 
 這類規則是 PVE native firewall 沒提供的功能  
