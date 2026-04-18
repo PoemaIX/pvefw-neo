@@ -202,13 +202,15 @@ fi
 #     firewall=1 → warned + skipped (fwbr blocks our direct-attach)
 #     <vmid>.fw with @neo:disable on a port → that port bypasses pvefw-neo
 #
-# To preserve the user's original intent, install.sh offers TWO migrations:
+# To preserve the user's original intent, install.sh offers a single
+# atomic migration plan combining two actions (applied together or not
+# at all, via one y/N prompt):
 #
-#   Migration 1: flip existing firewall=1 → firewall=0
+#   A. Flip existing firewall=1 → firewall=0
 #     User previously wanted this NIC protected. pvefw-neo now takes over.
 #     One-shot via `qm set` / `pct set`.
 #
-#   Migration 2: add @neo:disable to previously-unfiltered ports
+#   B. Add @neo:disable to previously-unfiltered ports
 #     User previously had no firewall on these NICs (PVE didn't filter).
 #     Without intervention, pvefw-neo would NOW start filtering them, which
 #     may surprise the user (e.g. enable: 1 catch-all DROP takes effect).
@@ -276,86 +278,66 @@ echo "  Found:"
 echo "    firewall=1 (previously filtered by PVE):       $n_fw1"
 echo "    firewall=0 or unset (previously unfiltered):   $n_unfiltered"
 
-# ── Migration 1: firewall=1 → firewall=0 ──
-if [ "$n_fw1" -gt 0 ]; then
+# ── Combined migration prompt (atomic: both or neither) ──
+if [ "$n_fw1" -gt 0 ] || [ "$n_unfiltered" -gt 0 ]; then
     echo ""
     echo "────────────────────────────────────────────────────────────"
-    echo "Migration 1: flip firewall=1 → firewall=0"
+    echo "Migration plan"
     echo ""
-    echo "$n_fw1 NIC(s) previously filtered by PVE native will be"
-    echo "managed by pvefw-neo after flipping. This removes the fwbr"
-    echo "so tap/veth attaches directly to vmbr."
-    echo ""
-    echo "NICs to flip:"
-    awk -F'|' '$4==1 && $5==1 {printf "    %s %s %s\n", $1, $2, $3}' "$tmpfile"
-    echo ""
-    read -p "Flip firewall=1 → firewall=0 on these NICs? [y/N] " -r yn
-    echo
-    if [[ $yn =~ ^[Yy]$ ]]; then
-        awk -F'|' '$4==1 && $5==1 {print $1, $2, $3}' "$tmpfile" | while read type vmid nic; do
-            conf=$(case "$type" in
-                qm)  echo "/etc/pve/qemu-server/$vmid.conf" ;;
-                pct) echo "/etc/pve/lxc/$vmid.conf" ;;
-            esac)
-            current=$(awk "/^\\[/{exit} /^${nic}:/ {print; exit}" "$conf" | sed "s/^${nic}: //")
-            new=$(echo "$current" | sed 's/\bfirewall=1\b/firewall=0/')
-            echo "    $type $vmid $nic: firewall=1 → firewall=0"
-            $type set $vmid --$nic "$new" >/dev/null 2>&1 || echo "      [!] failed"
-        done
-        echo "  [+] Done. Changes are live (takes effect on next VM start for stopped VMs)."
-    else
-        echo "  [=] Skipped. Ports with firewall=1 will be warned + skipped by pvefw-neo."
+    if [ "$n_fw1" -gt 0 ]; then
+        echo "  A. Flip firewall=1 → firewall=0  ($n_fw1 NIC(s))"
+        echo "     Previously filtered by PVE native. pvefw-neo takes over;"
+        echo "     fwbr is removed so tap/veth attaches directly to vmbr."
+        awk -F'|' '$4==1 && $5==1 {printf "       %s %s %s\n", $1, $2, $3}' "$tmpfile"
+        echo ""
     fi
-fi
-
-# ── Migration 2: add @neo:disable to previously-unfiltered NICs ──
-if [ "$n_unfiltered" -gt 0 ]; then
-    echo ""
-    echo "────────────────────────────────────────────────────────────"
-    echo "Migration 2: preserve unfiltered ports via @neo:disable"
-    echo ""
-    echo "$n_unfiltered NIC(s) were previously unfiltered (firewall=0 or"
-    echo "unset). After pvefw-neo takes over, any VM with"
-    echo "[OPTIONS] enable: 1 in its .fw file will have its rules applied"
-    echo "to these NICs too — potentially filtering them for the first"
-    echo "time (e.g. policy_in: DROP will start blocking inbound traffic)."
-    echo ""
-    echo "To preserve the original 'unfiltered' behavior, pvefw-neo can"
-    echo "add a @neo:disable sugar tag for each of these NICs in the"
-    echo "corresponding <vmid>.fw file:"
-    echo ""
-    echo "    |OUT Finger(DROP) -i <netN> # @neo:disable"
-    echo ""
-    echo "You can remove these lines later to let pvefw-neo manage them."
-    echo ""
-    echo "NICs to add @neo:disable to:"
-    awk -F'|' '$4==0 || ($4==1 && $5==0) {printf "    %s %s %s\n", $1, $2, $3}' "$tmpfile"
-    echo ""
-    read -p "Add @neo:disable to all previously-unfiltered NICs? [y/N] " -r yn
+    if [ "$n_unfiltered" -gt 0 ]; then
+        echo "  B. Add @neo:disable sugar tag  ($n_unfiltered NIC(s))"
+        echo "     Previously unfiltered (firewall=0 or unset). Without this,"
+        echo "     pvefw-neo would start filtering them once the VM's .fw has"
+        echo "     [OPTIONS] enable: 1 (e.g. policy_in: DROP would kick in)."
+        echo "     Inserted line (per NIC) in <vmid>.fw [RULES]:"
+        echo "       |OUT Finger(DROP) -i <netN> # @neo:disable"
+        echo "     You can remove these lines later to let pvefw-neo manage them."
+        awk -F'|' '$4==0 || ($4==1 && $5==0) {printf "       %s %s %s\n", $1, $2, $3}' "$tmpfile"
+        echo ""
+    fi
+    read -p "Apply migration plan? [y/N] " -r yn
     echo
     if [[ $yn =~ ^[Yy]$ ]]; then
-        awk -F'|' '$4==0 || ($4==1 && $5==0) {print $1, $2, $3}' "$tmpfile" \
-        | while read type vmid nic; do
-            fwfile="/etc/pve/firewall/${vmid}.fw"
-            tag_line="|OUT Finger(DROP) -i ${nic} # @neo:disable"
+        # A. firewall=1 → firewall=0
+        if [ "$n_fw1" -gt 0 ]; then
+            awk -F'|' '$4==1 && $5==1 {print $1, $2, $3}' "$tmpfile" | while read type vmid nic; do
+                conf=$(case "$type" in
+                    qm)  echo "/etc/pve/qemu-server/$vmid.conf" ;;
+                    pct) echo "/etc/pve/lxc/$vmid.conf" ;;
+                esac)
+                current=$(awk "/^\\[/{exit} /^${nic}:/ {print; exit}" "$conf" | sed "s/^${nic}: //")
+                new=$(echo "$current" | sed 's/\bfirewall=1\b/firewall=0/')
+                echo "    $type $vmid $nic: firewall=1 → firewall=0"
+                $type set $vmid --$nic "$new" >/dev/null 2>&1 || echo "      [!] failed"
+            done
+        fi
 
-            # Ensure .fw exists with a [RULES] section
-            if [ ! -f "$fwfile" ]; then
-                printf '[OPTIONS]\n\nenable: 1\n\n[RULES]\n\n' > "$fwfile"
-            elif ! grep -q "^\[RULES\]" "$fwfile"; then
-                printf '\n[RULES]\n\n' >> "$fwfile"
-            fi
+        # B. @neo:disable for previously-unfiltered NICs
+        if [ "$n_unfiltered" -gt 0 ]; then
+            awk -F'|' '$4==0 || ($4==1 && $5==0) {print $1, $2, $3}' "$tmpfile" \
+            | while read type vmid nic; do
+                fwfile="/etc/pve/firewall/${vmid}.fw"
+                tag_line="|OUT Finger(DROP) -i ${nic} # @neo:disable"
 
-            # Skip if already present
-            if grep -Fq "$tag_line" "$fwfile"; then
-                echo "    $type $vmid $nic: already has @neo:disable, skipping"
-                continue
-            fi
+                if [ ! -f "$fwfile" ]; then
+                    printf '[OPTIONS]\n\nenable: 1\n\n[RULES]\n\n' > "$fwfile"
+                elif ! grep -q "^\[RULES\]" "$fwfile"; then
+                    printf '\n[RULES]\n\n' >> "$fwfile"
+                fi
 
-            # Append inside the [RULES] section (at end of file is fine —
-            # only [group ...] would come after it and we don't create those)
-            # Using python to insert after [RULES] header to keep groups at end.
-            python3 - "$fwfile" "$tag_line" <<'PYEOF'
+                if grep -Fq "$tag_line" "$fwfile"; then
+                    echo "    $type $vmid $nic: already has @neo:disable, skipping"
+                    continue
+                fi
+
+                python3 - "$fwfile" "$tag_line" <<'PYEOF'
 import sys
 path, line = sys.argv[1], sys.argv[2]
 with open(path) as f:
@@ -369,9 +351,7 @@ for i, ln in enumerate(content):
         in_rules = True
         continue
     if in_rules and not inserted:
-        # Insert right after [RULES] header (possibly after a blank line)
         if ln.strip().startswith("[") and ln.strip().lower() != "[rules]":
-            # Next section started without any rules — insert before it
             out.insert(-1, line)
             inserted = True
             in_rules = False
@@ -379,17 +359,19 @@ if in_rules and not inserted:
     out.append(line)
     inserted = True
 if not inserted:
-    # No [RULES] section found (shouldn't happen as we ensured it above)
     out.append("[RULES]")
     out.append(line)
 with open(path, "w") as f:
     f.write("\n".join(out).rstrip() + "\n")
 PYEOF
-            echo "    $type $vmid $nic: added @neo:disable to $fwfile"
-        done
-        echo "  [+] Done. Remove the @neo:disable lines later to let pvefw-neo manage these ports."
+                echo "    $type $vmid $nic: added @neo:disable to $fwfile"
+            done
+        fi
+        echo "  [+] Migration applied."
     else
-        echo "  [=] Skipped. These ports will be managed by pvefw-neo if their VM has enable: 1."
+        echo "  [=] Skipped entire migration plan."
+        [ "$n_fw1" -gt 0 ] && echo "      firewall=1 NICs will be warned + skipped by pvefw-neo."
+        [ "$n_unfiltered" -gt 0 ] && echo "      Previously-unfiltered NICs will be managed by pvefw-neo if VM has enable: 1."
     fi
 fi
 
