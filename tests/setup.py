@@ -23,6 +23,7 @@ Usage:
 """
 
 import glob
+import json
 import os
 import sys
 
@@ -31,6 +32,9 @@ from lib import (
     slot_iface, slot_ip, slot_netindex, guest_ifname,
     detect_vm_exec, wait_for_guest, exec_vm, exec_ct,
 )
+
+API_TOKEN_USER = "root@pam"
+API_TOKEN_ID = "pvefw-neo-test"
 
 IF_FILE = "/etc/network/interfaces"
 
@@ -124,10 +128,12 @@ def setup_vm():
             else:
                 sys.exit(r.stderr.strip() or "qm clone failed")
 
-    # Inject cloud-init credentials + SSH key.
+    # Inject cloud-init credentials + SSH key; size the VM for the parallel
+    # runner — a single core starves concurrent exec sessions and flakes pings.
     sh(["qm", "set", str(CFG.vmid_vm),
         "--ciuser", CFG.ci_user, "--cipassword", CFG.ci_pass,
-        "--sshkeys", CFG.test_ssh_key + ".pub"], check=True)
+        "--sshkeys", CFG.test_ssh_key + ".pub",
+        "--cores", str(CFG.vm_cores)], check=True)
 
     # Rewrite NICs: net0 = mgmt, net1..N = linux slots, net(N+1)..2N = ovs slots.
     n_ifaces = 2 * CFG.n_slots + 1
@@ -179,7 +185,8 @@ def setup_ct():
                              f"ip={slot_ip(backend, slot, CFG.ct_octet)}/24,firewall=0"]
         sh(["pct", "create", str(CFG.vmid_ct), template,
             "--hostname", "pvefw-neo-test-ct",
-            "--memory", "256", "--swap", "0", "--cores", "1",
+            "--memory", str(CFG.ct_memory), "--swap", "0",
+            "--cores", str(CFG.ct_cores),
             "--rootfs", f"{CFG.ct_storage}:{CFG.ct_rootfs_size}",
             "--password", CFG.ct_pass,
             "--unprivileged", "1", *net_args], check=True)
@@ -204,6 +211,24 @@ def wait_and_pick_channel():
     log("[*] Waiting for CT...")
     if not wait_for_guest("ct", tries=30):
         warn("CT not responding — tests that exercise the CT will fail")
+
+
+def setup_api_token():
+    """Create a PVE API token so the suite hits the HTTP API directly — same
+    endpoint the WebUI uses, ~30x faster than spawning the pvesh CLI per call.
+    Token managing is scaffolding (not a firewall op), so the CLI is fine here."""
+    sh(["pveum", "user", "token", "remove", API_TOKEN_USER, API_TOKEN_ID])  # stale
+    r = sh(["pveum", "user", "token", "add", API_TOKEN_USER, API_TOKEN_ID,
+            "--privsep", "0", "--output-format", "json"])
+    try:
+        secret = json.loads(r.stdout)["value"]
+    except (ValueError, KeyError):
+        warn("could not create API token — suite falls back to the pvesh CLI")
+        return
+    token = f"{API_TOKEN_USER}!{API_TOKEN_ID}={secret}"
+    with open(os.path.join(CFG.test_tmp, "env"), "a") as fh:
+        fh.write(f"PVE_API_TOKEN={token}\n")
+    log("[+] Created PVE API token for the suite (HTTP API, fast path)")
 
 
 def _last_line(out):
@@ -235,7 +260,7 @@ def push_agent():
     import base64
     src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "agent.py")
     blob = base64.b64encode(open(src, "rb").read()).decode()
-    dst = "/tmp/pvefw-agent.py"
+    dst = "/opt/pvefw-agent.py"
     log(f"[+] Pushing test agent to guests ({dst})")
     script = (
         f"echo '{blob}' | base64 -d > {dst} && chmod +x {dst} && "
@@ -278,6 +303,7 @@ def main():
     setup_vm()
     setup_ct()
     wait_and_pick_channel()
+    setup_api_token()
     install_tools()
     push_agent()
     cache_ifnames()

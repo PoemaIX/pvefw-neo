@@ -18,13 +18,16 @@ Guest NICs: net0 = mgmt, net1..N = linux slots, net(N+1)..2N = ovs slots.
 
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import re
 import socket
+import ssl
 import subprocess
 import threading
 import time
+import urllib.parse
 from dataclasses import dataclass, field
 
 
@@ -67,6 +70,11 @@ class Config:
     ct_storage: str = field(default_factory=lambda: _env("CT_STORAGE", "local-lvm"))
     ct_rootfs_size: int = field(default_factory=lambda: _env_int("CT_ROOTFS_SIZE", "2"))
     ct_template: str = field(default_factory=lambda: _env("CT_TEMPLATE", ""))
+    # Guests run many concurrent exec sessions under the parallel runner — a
+    # single core starves the ping/tcpdump processes and flakes timeouts.
+    vm_cores: int = field(default_factory=lambda: _env_int("VM_CORES", "4"))
+    ct_cores: int = field(default_factory=lambda: _env_int("CT_CORES", "2"))
+    ct_memory: int = field(default_factory=lambda: _env_int("CT_MEMORY", "512"))
     ci_user: str = field(default_factory=lambda: _env("CI_USER", "debian"))
     ci_pass: str = field(default_factory=lambda: _env("CI_PASS", "changeme"))
     ct_pass: str = field(default_factory=lambda: _env("CT_PASS", "changeme"))
@@ -131,16 +139,26 @@ QGA_LOCK = threading.Lock()     # serialises qemu-guest-agent exec (one client o
 # this and writes it to <test_tmp>/env; we pick it up here on import.
 VM_EXEC_MODE = "qga"
 
+# PVE API token (`user!tokenid=secret`). setup.py creates one and writes it to
+# <test_tmp>/env; with it, firewall ops hit the HTTP API directly (~30x faster
+# than the pvesh CLI — same endpoint the WebUI uses). Empty → pvesh CLI fallback.
+_PVE_API_TOKEN = os.environ.get("PVE_API_TOKEN", "")
+
 
 def _load_env_file():
-    global VM_EXEC_MODE
+    global VM_EXEC_MODE, _PVE_API_TOKEN
     path = os.path.join(CFG.test_tmp, "env")
     if not os.path.exists(path):
         return
     for line in open(path):
-        line = line.strip()
-        if line.startswith("VM_EXEC_MODE="):
-            VM_EXEC_MODE = line.split("=", 1)[1]
+        line = line.rstrip("\n")
+        if "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        if key == "VM_EXEC_MODE":
+            VM_EXEC_MODE = val
+        elif key == "PVE_API_TOKEN":
+            _PVE_API_TOKEN = val
 
 
 os.makedirs(os.path.join(CFG.test_tmp, "ifcache"), exist_ok=True)
@@ -252,8 +270,16 @@ def exec_vm(script):
 
 
 def exec_ct(script):
-    """Run a shell script as root inside the CT. pct exec is parallel-safe."""
-    return sh(["pct", "exec", str(CFG.vmid_ct), "--", "/bin/sh", "-c", script]).stdout
+    """Run a shell script as root inside the CT. pct exec is parallel-safe but
+    can occasionally hiccup under heavy concurrency — retry once on an empty
+    result, same as the VM's SSH path."""
+    p = None
+    for _ in range(2):
+        p = sh(["pct", "exec", str(CFG.vmid_ct), "--", "/bin/sh", "-c", script])
+        if p.returncode == 0 or p.stdout.strip():
+            return p.stdout
+        time.sleep(0.5)
+    return p.stdout
 
 
 def exec_on(kind, script):
@@ -340,28 +366,83 @@ def vmid_of(kind):
     return CFG.vmid_vm if kind == "vm" else CFG.vmid_ct
 
 
-def pvesh_json(path):
-    """GET a pvesh path, parse JSON. Returns [] / {} on any failure."""
-    p = sh(["pvesh", "get", path, "--output-format", "json"])
+# ── PVE API transport ──
+# Every firewall mutation goes through the PVE API — the exact path the WebUI
+# uses — so tests exercise what a real user does. The HTTP API (token auth) is
+# ~30x faster than spawning the `pvesh` CLI per call; `pvesh` stays as a
+# fallback when no token is configured.
+def _pve_http(method, path, params):
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    conn = http.client.HTTPSConnection("localhost", 8006, context=ctx, timeout=20)
+    headers = {"Authorization": f"PVEAPIToken={_PVE_API_TOKEN}"}
+    url = "/api2/json" + path
+    body = None
+    if method in ("GET", "DELETE"):
+        if params:
+            url += "?" + urllib.parse.urlencode(params)
+    elif params:
+        body = urllib.parse.urlencode(params)
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
     try:
-        return json.loads(p.stdout)
-    except ValueError:
-        return []
+        conn.request(method, url, body=body, headers=headers)
+        resp = conn.getresponse()
+        raw = resp.read().decode("utf-8", "replace")
+        ok = resp.status < 400
+        if method == "GET":
+            if not ok or not raw.strip():
+                return None
+            try:
+                return json.loads(raw).get("data")
+            except ValueError:
+                return None
+        return ok
+    except (OSError, ValueError):
+        return None if method == "GET" else False
+    finally:
+        conn.close()
+
+
+def _api(method, path, params=None):
+    """PVE API call. method=GET/POST/PUT/DELETE; params is a dict with keys in
+    API form (e.g. 'icmp-type'). GET → parsed `data` (or None); other methods
+    → True/False. Uses the HTTP API when a token is set, else the pvesh CLI."""
+    params = params or {}
+    if _PVE_API_TOKEN:
+        return _pve_http(method, path, params)
+    verb = {"GET": "get", "POST": "create", "PUT": "set", "DELETE": "delete"}[method]
+    args = ["pvesh", verb, path]
+    for k, v in params.items():
+        args += [f"--{k}", str(v)]
+    if method == "GET":
+        args += ["--output-format", "json"]
+        p = sh(args)
+        try:
+            return json.loads(p.stdout)
+        except ValueError:
+            return None
+    return sh(args).returncode == 0
+
+
+def pvesh_json(path):
+    """GET a PVE API path, return parsed data ([] on failure)."""
+    data = _api("GET", path)
+    return data if data is not None else []
 
 
 def fw_rule(kind, action, type_, **opts):
-    """Create a firewall rule. opts pass through to pvesh (iface, proto, dport,
-    source, dest, macro, comment, icmp_type → --icmp-type ...).
+    """Create a firewall rule. opts pass through as API params (iface, proto,
+    dport, source, dest, macro, comment, icmp_type → icmp-type ...).
 
-    NOTE: pvesh create always PREPENDS (position 0). Order-sensitive tests must
+    NOTE: rule create always PREPENDS (position 0). Order-sensitive tests must
     create bottom-up (catch-all first). Parallel tests MUST always pass iface=
     — an iface-less rule fans out to every NIC and clobbers other slots."""
-    args = ["pvesh", "create", f"{fw_base(kind)}/rules",
-            "--action", action, "--type", type_, "--enable", "1"]
+    params = {"action": action, "type": type_, "enable": "1"}
     for k, v in opts.items():
-        args += [f"--{k.replace('_', '-')}", str(v)]
+        params[k.replace("_", "-")] = v
     with CFG_LOCK:
-        sh(args)
+        _api("POST", f"{fw_base(kind)}/rules", params)
 
 
 def fw_ext(kind, iface, comment, **opts):
@@ -374,7 +455,7 @@ def fw_clear(kind):
     base = fw_base(kind)
     with CFG_LOCK:
         while pvesh_json(f"{base}/rules"):
-            if not sh_ok(["pvesh", "delete", f"{base}/rules/0"]):
+            if not _api("DELETE", f"{base}/rules/0"):
                 break
 
 
@@ -387,80 +468,80 @@ def slot_clear(kind, backend, slot):
         rules = pvesh_json(f"{base}/rules")
         idxs = [i for i, r in enumerate(rules) if r.get("iface") == iface]
         for i in sorted(idxs, reverse=True):
-            sh(["pvesh", "delete", f"{base}/rules/{i}"])
+            _api("DELETE", f"{base}/rules/{i}")
 
 
 def fw_enable(kind):
     with CFG_LOCK:
-        sh(["pvesh", "set", f"{fw_base(kind)}/options", "--enable", "1"])
+        _api("PUT", f"{fw_base(kind)}/options", {"enable": "1"})
 
 
 def fw_disable(kind):
     with CFG_LOCK:
-        sh(["pvesh", "set", f"{fw_base(kind)}/options", "--enable", "0"])
+        _api("PUT", f"{fw_base(kind)}/options", {"enable": "0"})
 
 
 # Cluster-wide ipset / alias.
 def cluster_ipset_create(name):
     with CFG_LOCK:
-        sh(["pvesh", "create", "/cluster/firewall/ipset", "--name", name])
+        _api("POST", "/cluster/firewall/ipset", {"name": name})
 
 
 def cluster_ipset_add(name, cidr, nomatch=False):
-    args = ["pvesh", "create", f"/cluster/firewall/ipset/{name}", "--cidr", cidr]
+    params = {"cidr": cidr}
     if nomatch:
-        args += ["--nomatch", "1"]
+        params["nomatch"] = "1"
     with CFG_LOCK:
-        sh(args)
+        _api("POST", f"/cluster/firewall/ipset/{name}", params)
 
 
 def cluster_ipset_del(name):
     with CFG_LOCK:
-        sh(["pvesh", "delete", f"/cluster/firewall/ipset/{name}", "--force", "1"])
+        _api("DELETE", f"/cluster/firewall/ipset/{name}", {"force": "1"})
 
 
 def cluster_alias_create(name, cidr):
     with CFG_LOCK:
-        sh(["pvesh", "create", "/cluster/firewall/aliases", "--name", name, "--cidr", cidr])
+        _api("POST", "/cluster/firewall/aliases", {"name": name, "cidr": cidr})
 
 
 def cluster_alias_set(name, cidr):
     with CFG_LOCK:
-        sh(["pvesh", "set", f"/cluster/firewall/aliases/{name}", "--cidr", cidr])
+        _api("PUT", f"/cluster/firewall/aliases/{name}", {"cidr": cidr})
 
 
 def cluster_alias_del(name):
     with CFG_LOCK:
-        sh(["pvesh", "delete", f"/cluster/firewall/aliases/{name}"])
+        _api("DELETE", f"/cluster/firewall/aliases/{name}")
 
 
 # Per-VM/CT ipset / alias.
 def guest_ipset_create(kind, name):
     with CFG_LOCK:
-        sh(["pvesh", "create", f"{fw_base(kind)}/ipset", "--name", name])
+        _api("POST", f"{fw_base(kind)}/ipset", {"name": name})
 
 
 def guest_ipset_add(kind, name, cidr, nomatch=False):
-    args = ["pvesh", "create", f"{fw_base(kind)}/ipset/{name}", "--cidr", cidr]
+    params = {"cidr": cidr}
     if nomatch:
-        args += ["--nomatch", "1"]
+        params["nomatch"] = "1"
     with CFG_LOCK:
-        sh(args)
+        _api("POST", f"{fw_base(kind)}/ipset/{name}", params)
 
 
 def guest_ipset_del(kind, name):
     with CFG_LOCK:
-        sh(["pvesh", "delete", f"{fw_base(kind)}/ipset/{name}", "--force", "1"])
+        _api("DELETE", f"{fw_base(kind)}/ipset/{name}", {"force": "1"})
 
 
 def guest_alias_create(kind, name, cidr):
     with CFG_LOCK:
-        sh(["pvesh", "create", f"{fw_base(kind)}/aliases", "--name", name, "--cidr", cidr])
+        _api("POST", f"{fw_base(kind)}/aliases", {"name": name, "cidr": cidr})
 
 
 def guest_alias_del(kind, name):
     with CFG_LOCK:
-        sh(["pvesh", "delete", f"{fw_base(kind)}/aliases/{name}"])
+        _api("DELETE", f"{fw_base(kind)}/aliases/{name}")
 
 
 def fw_apply():
@@ -471,22 +552,17 @@ def fw_apply():
 
 
 def fw_rule_enabled(kind, pos):
-    p = sh(["pvesh", "get", f"{fw_base(kind)}/rules/{pos}", "--output-format", "json"])
+    data = _api("GET", f"{fw_base(kind)}/rules/{pos}")
     try:
-        return int(json.loads(p.stdout).get("enable", 0))
-    except (ValueError, AttributeError):
+        return int(data.get("enable", 0))
+    except (AttributeError, TypeError, ValueError):
         return 0
 
 
 def fw_log_has_quarantine(kind, pos):
     """True if the latest firewall-log entry is a quarantine line for rule #pos."""
-    p = sh(["pvesh", "get", f"{fw_base(kind)}/log", "--limit", "50",
-            "--output-format", "json"])
-    try:
-        entries = json.loads(p.stdout)
-        last = entries[-1].get("t", "") if entries else ""
-    except (ValueError, AttributeError, IndexError):
-        last = ""
+    data = _api("GET", f"{fw_base(kind)}/log", {"limit": "50"})
+    last = data[-1].get("t", "") if isinstance(data, list) and data else ""
     return bool(re.search(rf"\[pvefw-neo\] invalid rule #{pos} disabled, reason: ", last))
 
 
@@ -496,20 +572,16 @@ def _del_tst_sets():
         base = fw_base(kind)
         for s in pvesh_json(f"{base}/ipset"):
             if s.get("name", "").startswith("tst_"):
-                with CFG_LOCK:
-                    sh(["pvesh", "delete", f"{base}/ipset/{s['name']}", "--force", "1"])
+                guest_ipset_del(kind, s["name"])
         for a in pvesh_json(f"{base}/aliases"):
             if a.get("name", "").startswith("tst_"):
-                with CFG_LOCK:
-                    sh(["pvesh", "delete", f"{base}/aliases/{a['name']}"])
+                guest_alias_del(kind, a["name"])
     for s in pvesh_json("/cluster/firewall/ipset"):
         if s.get("name", "").startswith("tst_"):
-            with CFG_LOCK:
-                sh(["pvesh", "delete", f"/cluster/firewall/ipset/{s['name']}", "--force", "1"])
+            cluster_ipset_del(s["name"])
     for a in pvesh_json("/cluster/firewall/aliases"):
         if a.get("name", "").startswith("tst_"):
-            with CFG_LOCK:
-                sh(["pvesh", "delete", f"/cluster/firewall/aliases/{a['name']}"])
+            cluster_alias_del(a["name"])
 
 
 def fw_global_reset():
@@ -539,7 +611,7 @@ def ping_between(from_kind, iface, to_ip):
     one retry smooths a transient parallel-load hiccup. A genuinely blocked
     path stays blocked across both attempts."""
     for _ in range(2):
-        out = exec_on(from_kind, f"ping -c 2 -W 2 -I {iface} {to_ip} 2>/dev/null")
+        out = exec_on(from_kind, f"ping -c 3 -W 2 -I {iface} {to_ip} 2>/dev/null")
         m = re.search(r"(\d+) received", out)
         if m and int(m.group(1)) >= 1:
             return True
@@ -563,7 +635,7 @@ def probe_ping_rev(backend, slot):
 # In-guest agent (tests/agent.py, pushed to the guests by setup.py). It forges
 # stateless frames and provides stdlib-socket connect/listen — no scapy, no
 # hping3/ncat. Capture stays on tcpdump (below).
-AGENT = "/tmp/pvefw-agent.py"
+AGENT = "/opt/pvefw-agent.py"
 
 
 def _agent(kind, *args):

@@ -147,6 +147,13 @@ def start_daemon():
         sh(["systemctl", "start", "pvefw-neo"])
 
 
+def remove_api_token():
+    # The token setup.py created for the HTTP API fast-path.
+    if sh(["pveum", "user", "token", "remove",
+           "root@pam", "pvefw-neo-test"]).returncode == 0:
+        log("[-] Removed PVE API token")
+
+
 def main():
     if os.geteuid() != 0:
         sys.exit("clean.py must run as root")
@@ -154,6 +161,7 @@ def main():
     log(CFG.summary())
     destroy_guests()
     remove_cluster_artifacts()
+    remove_api_token()
     flush_pvefw_neo()
     remove_nat()
     remove_bridges()
