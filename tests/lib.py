@@ -223,13 +223,22 @@ def vm_tap(backend, slot):
 # ─────────────────────────── Guest exec ───────────────────────────
 def exec_vm(script):
     """Run a shell script as root inside the VM. SSH when available (parallel-
-    safe), else qemu-guest-agent (serialised — the qga socket is single-client)."""
+    safe), else qemu-guest-agent (serialised — the qga socket is single-client).
+
+    The SSH path retries once on an empty result: under heavy parallel load a
+    connection can occasionally fail to establish. A real command that yields
+    no stdout at all is rare, so the retry is cheap insurance against flakes."""
     if VM_EXEC_MODE == "ssh":
-        p = subprocess.run(
-            ["ssh", "-i", CFG.test_ssh_key, *SSH_OPTS,
-             f"{CFG.ci_user}@{CFG.vm_mgmt_ip}", "sudo", "/bin/sh"],
-            input=script, capture_output=True, text=True,
-        )
+        p = None
+        for _ in range(2):
+            p = subprocess.run(
+                ["ssh", "-i", CFG.test_ssh_key, *SSH_OPTS,
+                 f"{CFG.ci_user}@{CFG.vm_mgmt_ip}", "sudo", "/bin/sh"],
+                input=script, capture_output=True, text=True,
+            )
+            if p.returncode == 0 or p.stdout.strip():
+                return p.stdout
+            time.sleep(0.5)
         return p.stdout
     with QGA_LOCK:
         # Generous timeout — a quick command still returns immediately; this
@@ -307,10 +316,12 @@ def guest_ifname(kind, backend, slot):
     name = ""
     for line in out.splitlines():
         if mac in line.lower():
-            # line: "2: eth1: <...> ... link/ether bc:24:.. ..."
+            # line: "3: eth1@if122: <...> ... link/ether bc:24:.. ..."
+            # veth interfaces carry an "@ifN" peer suffix — strip it, the
+            # bare name is what `ping -I` / `tcpdump -i` expect.
             parts = line.split(":")
             if len(parts) >= 2:
-                name = parts[1].strip()
+                name = parts[1].strip().split("@")[0]
                 break
     if name:
         with open(cf, "w") as fh:
@@ -524,10 +535,15 @@ def slot_ct_flush(backend, slot):
 
 # ─────────────────────────── Packet-test helpers ───────────────────────────
 def ping_between(from_kind, iface, to_ip):
-    """ICMP echo from a guest iface to an IP. -c 2 covers first-packet ARP."""
-    out = exec_on(from_kind, f"ping -c 2 -W 2 -I {iface} {to_ip} 2>/dev/null")
-    m = re.search(r"(\d+) received", out)
-    return bool(m and int(m.group(1)) >= 1)
+    """ICMP echo from a guest iface to an IP. -c 2 covers first-packet ARP;
+    one retry smooths a transient parallel-load hiccup. A genuinely blocked
+    path stays blocked across both attempts."""
+    for _ in range(2):
+        out = exec_on(from_kind, f"ping -c 2 -W 2 -I {iface} {to_ip} 2>/dev/null")
+        m = re.search(r"(\d+) received", out)
+        if m and int(m.group(1)) >= 1:
+            return True
+    return False
 
 
 def probe_ping(backend, slot):
@@ -579,24 +595,31 @@ def start_listener(kind, port):
     time.sleep(0.5)
 
 
-def cap_start(kind, iface, tag, bpf, secs=4):
-    """Arm a self-terminating tcpdump inside a guest. The BPF should be MAC-
-    scoped (`ether src <mac> and ...`) so a frame leaked from another slot can
-    never be miscounted. Caller then fires traffic, waits out `secs`, reads
-    cap_count()."""
-    # -U: write each packet immediately, so a SIGTERM from `timeout` can't lose
-    # buffered frames. -p: don't force promiscuous (we only want our own slot).
-    # All three std fds are redirected (incl. </dev/null) so the SSH channel
-    # closes immediately instead of waiting on the backgrounded tcpdump.
+def cap_start(kind, iface, tag, bpf):
+    """Arm a tcpdump capture inside a guest. The BPF should be MAC-scoped
+    (`ether src <mac> and ...`) so a frame leaked from another slot can never
+    be miscounted.
+
+    The caller fires traffic, then cap_count() stops + reads the capture —
+    the window is however long the firing takes, not a fixed race against a
+    `timeout` (which flaked when parallel-load slowed the exec channel). The
+    30s timeout is only a safety net for a leaked capture.
+
+    -U writes each packet immediately; -p skips promiscuous mode; all three
+    std fds are redirected so the SSH channel closes instead of waiting on
+    the backgrounded tcpdump."""
     exec_on(kind,
             f"rm -f /tmp/cap_{tag}.pcap 2>/dev/null; "
-            f"nohup timeout {secs} tcpdump -i {iface} -nn -p -U -w /tmp/cap_{tag}.pcap "
+            f"nohup timeout 30 tcpdump -i {iface} -nn -p -U -w /tmp/cap_{tag}.pcap "
             f"'{bpf}' </dev/null >/dev/null 2>&1 &")
-    time.sleep(1)
+    time.sleep(1)   # let tcpdump attach before the caller fires
 
 
 def cap_count(kind, tag):
-    """Number of packets captured by a prior cap_start()."""
+    """Stop the capture armed by cap_start() and return the packet count."""
+    # pkill matches both the `timeout` wrapper and tcpdump (the pcap path is
+    # in both their argv); the short sleep lets the final packet flush.
+    exec_on(kind, f"pkill -f 'cap_{tag}.pcap' 2>/dev/null; sleep 0.3; true")
     out = exec_on(kind, f"tcpdump -r /tmp/cap_{tag}.pcap 2>/dev/null | wc -l")
     try:
         return int(out.strip())

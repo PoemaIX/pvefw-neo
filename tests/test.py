@@ -128,16 +128,16 @@ def test_nodhcp(t):
                    ip_src=t.vm_ip, ip_dst=t.ct_ip)
 
     # OFF — the DHCP-shaped frame escapes to the CT.
-    cap_start("ct", t.ct_eth, tag, bpf, secs=3)
+    cap_start("ct", t.ct_eth, tag, bpf)
     fire()
-    time.sleep(3)
+    time.sleep(1)
     t.check("off: DHCP-shaped UDP 67→68 escapes", True, cap_count("ct", tag) >= 1)
     # ON — frame is dropped, ordinary traffic still flows.
     fw_ext("vm", t.iface, "@neo:nodhcp")
     fw_apply()
-    cap_start("ct", t.ct_eth, tag, bpf, secs=3)
+    cap_start("ct", t.ct_eth, tag, bpf)
     fire()
-    time.sleep(3)
+    time.sleep(1)
     t.check("on: DHCP-shaped UDP 67→68 dropped", True, cap_count("ct", tag) == 0)
     t.check("on: ordinary traffic still passes", "PASS", t.ping())
 
@@ -147,16 +147,16 @@ def test_nora(t):
     tag = f"nora{t.netindex}"
     bpf = f"ether src {t.vm_mac} and icmp6 and ip6[40] == 134"
     # OFF — the forged RA escapes to the CT.
-    cap_start("ct", t.ct_eth, tag, bpf, secs=3)
+    cap_start("ct", t.ct_eth, tag, bpf)
     agent_send("vm", "ra", t.vm_eth, t.vm_mac)
-    time.sleep(3)
+    time.sleep(1)
     t.check("off: Router Advertisement escapes", True, cap_count("ct", tag) >= 1)
     # ON — RA dropped, IPv4 traffic still flows.
     fw_ext("vm", t.iface, "@neo:nora")
     fw_apply()
-    cap_start("ct", t.ct_eth, tag, bpf, secs=3)
+    cap_start("ct", t.ct_eth, tag, bpf)
     agent_send("vm", "ra", t.vm_eth, t.vm_mac)
-    time.sleep(3)
+    time.sleep(1)
     t.check("on: Router Advertisement dropped", True, cap_count("ct", tag) == 0)
     t.check("on: IPv4 traffic unaffected", "PASS", t.ping())
 
@@ -171,16 +171,16 @@ def test_nondp(t):
         agent_send("vm", "na", t.vm_eth, t.vm_mac)
 
     # OFF — both NS and NA escape to the CT.
-    cap_start("ct", t.ct_eth, tag, bpf, secs=3)
+    cap_start("ct", t.ct_eth, tag, bpf)
     fire()
-    time.sleep(3)
+    time.sleep(1)
     t.check("off: NS + NA escape", True, cap_count("ct", tag) >= 2)
     # ON — both dropped, IPv4 traffic still flows.
     fw_ext("vm", t.iface, "@neo:nondp")
     fw_apply()
-    cap_start("ct", t.ct_eth, tag, bpf, secs=3)
+    cap_start("ct", t.ct_eth, tag, bpf)
     fire()
-    time.sleep(3)
+    time.sleep(1)
     t.check("on: NS + NA dropped", True, cap_count("ct", tag) == 0)
     t.check("on: IPv4 traffic unaffected", "PASS", t.ping())
 
@@ -413,10 +413,10 @@ def test_spoof_combo(t):
     fake = f"{t.subnet}.99"
     tag = f"spoof{t.netindex}"
     bpf = f"ether src {t.vm_mac} and icmp and src host {fake}"
-    cap_start("ct", t.ct_eth, tag, bpf, secs=3)
+    cap_start("ct", t.ct_eth, tag, bpf)
     agent_send("vm", "icmp", t.vm_eth, t.vm_mac, eth_dst=t.ct_mac,
                ip_src=fake, ip_dst=t.ct_ip)
-    time.sleep(3)
+    time.sleep(1)
     t.check("on: forged src IP dropped", True, cap_count("ct", tag) == 0)
 
 
@@ -428,10 +428,10 @@ def test_cross_macspoof_only_ip(t):
     fake = f"{t.subnet}.99"
     tag = f"xmac{t.netindex}"
     bpf = f"ether src {t.vm_mac} and icmp and src host {fake}"
-    cap_start("ct", t.ct_eth, tag, bpf, secs=3)
+    cap_start("ct", t.ct_eth, tag, bpf)
     agent_send("vm", "icmp", t.vm_eth, t.vm_mac, eth_dst=t.ct_mac,
                ip_src=fake, ip_dst=t.ct_ip)
-    time.sleep(3)
+    time.sleep(1)
     t.check("macspoof-only: forged src IP still escapes (ipspoof inert)",
             True, cap_count("ct", tag) >= 1)
 
@@ -462,8 +462,9 @@ def test_cross_ipspoof_only_mac(t):
 
 
 def test_quarantine_ovs_icmp(t):
-    """OVS rejects an ether/proto family contradiction → rule auto-disabled,
-    log entry written, baseline traffic on the same bridge intact."""
+    """An ether/proto family contradiction (proto icmpv6 + @neo:ether ip) on an
+    OVS port → the front-end validator auto-disables the rule, writes a log
+    entry, and baseline traffic on the same bridge stays intact."""
     fw_rule("vm", "DROP", "out", iface=t.iface, proto="icmpv6",
             icmp_type="echo-request", comment="@neo:noct @neo:ether ip")
     fw_apply()
@@ -488,8 +489,8 @@ def test_quarantine_nft_set(t):
 
 
 def test_quarantine_self_heal(t):
-    """After the user fixes a quarantined rule and re-enables it, the next
-    apply leaves it enabled."""
+    """After the user fixes a quarantined rule (drops the contradictory
+    @neo:ether tag) and re-enables it, the next apply leaves it enabled."""
     fw_rule("vm", "DROP", "out", iface=t.iface, proto="icmpv6",
             icmp_type="echo-request", comment="@neo:noct @neo:ether ip")
     fw_apply()

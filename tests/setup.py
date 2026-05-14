@@ -258,11 +258,21 @@ def cache_ifnames():
                     warn(f"could not resolve {kind} {backend} slot{slot} ifname")
 
 
+def stop_daemon():
+    # The pvefw-neo daemon watches the .fw files and auto-applies; that would
+    # race the suite's explicit, locked fw_apply() calls. Stop it for the run —
+    # clean.py starts it back up.
+    if sh(["systemctl", "is-active", "--quiet", "pvefw-neo"]).returncode == 0:
+        log("[+] Stopping pvefw-neo daemon for the test run (clean.py restarts it)")
+        sh(["systemctl", "stop", "pvefw-neo"])
+
+
 def main():
     if os.geteuid() != 0:
         sys.exit("setup.py must run as root")
     log("═══ pvefw-neo test environment setup ═══")
     log(CFG.summary())
+    stop_daemon()
     setup_bridges()
     ensure_ssh_key()
     setup_vm()

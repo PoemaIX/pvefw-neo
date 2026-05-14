@@ -139,6 +139,14 @@ def wipe_scratch():
         log(f"[-] Wiped scratch dir {CFG.test_tmp}")
 
 
+def start_daemon():
+    # setup.py stopped the daemon so the suite could drive --apply itself;
+    # restore it to its normal running state.
+    if sh_ok(["systemctl", "is-enabled", "pvefw-neo"]):
+        log("[+] Starting pvefw-neo daemon")
+        sh(["systemctl", "start", "pvefw-neo"])
+
+
 def main():
     if os.geteuid() != 0:
         sys.exit("clean.py must run as root")
@@ -150,6 +158,7 @@ def main():
     remove_nat()
     remove_bridges()
     wipe_scratch()
+    start_daemon()
     log("═══ Teardown complete — VM/CT, rules, NAT and bridges all removed ═══")
 
 
