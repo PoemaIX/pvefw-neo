@@ -1266,11 +1266,11 @@ rule 因為「沒進 IR、nft_text 沒變」而被 skip apply，writeback 不會
 │   ├── quarantine.py                      # retry loop、error parser、.fw 寫回、firewall log
 │   ├── bridge.py                          # bridge isolation reconcile
 │   └── main.py                            # CLI + daemon loop
-├── tests/
-│   ├── setup.sh                           # 起測試 VM/CT、配置 bridge/網段
-│   ├── test.sh                            # 跨 nft/OVS/quarantine 整合測試
-│   ├── lib.sh                             # 共用 helper
-│   └── clean.sh                           # 還原
+├── tests/                                # stdlib-only Python，免 pip install
+│   ├── lib.py                             # Config（全 env var 可覆寫）+ 共用 helper
+│   ├── setup.py                           # 起測試 VM/CT、配置 bridge/網段
+│   ├── test.py                            # 跨 nft/OVS/quarantine 整合測試（slot job-pool 並行）
+│   └── clean.py                           # 全部還原（含 VM/CT/rule/NAT/bridge）
 ├── install.sh / upgrade.sh / uninstall.sh
 └── DESIGN.md / README.md / README.zh.md
 
@@ -1437,22 +1437,36 @@ Meter 需要 OF1.3，bridge 的 `protocols` 預設可能只有 OF1.0。pvefw-neo
 
 ## 14. 測試
 
-整合測試放在 `tests/`：
+整合測試放在 `tests/`，純 stdlib Python（免 `pip install`）：
 
-- `tests/setup.sh`：起一對 VM / CT，設好多 bridge / 多網段 slot
-- `tests/test.sh`：透過 `pvesh` 建 rule（走跟 WebUI 一樣的 API），再用
-  `qemu-guest-agent` / `pct exec` 做 packet-level 驗證
-- `tests/clean.sh`：還原環境
+- `tests/lib.py`：單一設定來源 `Config`（每個旋鈕都有對應 env var，方便在自己
+  機器上換 base image id / vmbr id / 網段而不衝突）+ 共用 helper
+- `tests/setup.py`：起一對 VM / CT（預設 linked clone），設好多 bridge / 多網段
+  slot，注入 SSH key 當並行 exec 通道
+- `tests/test.py`：透過 `pvesh` 建 rule（走跟 WebUI 一樣的 API），再用
+  SSH（VM）/ `pct exec`（CT）做 packet-level 驗證
+- `tests/clean.py`：全部還原 —— VM/CT、rule、cluster ipset/alias、NAT，以及
+  setup.py 建立的 bridge（只拆有 sentinel 標記的，不動使用者既有的同名 bridge）
+
+每個功能都跑 **OFF/ON 雙向**：關閉時該擋的封包能出去（證明測試真的有在動流量），
+打開後該擋的真的擋住、該放行的正確放行。
+
+並行模型 —— **slot job-pool**：每個 backend 有 `N_SLOTS` 條 lane（= guest NIC），
+各自一個 /24，一條 lane 同時只屬於一個測試，所以兩個測試不會共用 L2 廣播域。
+抓包驗證的 BPF 額外綁定預期 sender 的 MAC，漏到共用 bridge 的訊框也不會被誤算。
+會改 NIC MAC、或依賴 rule 位置的測試（quarantine）排在後面的序列階段單獨跑。
 
 涵蓋的場景：
 
 | 範疇 | 說明 |
 |------|------|
-| Extension rules | macspoof / ipspoof / nodhcp / nora / nondp / mcast_limit / isolated / disable |
-| Decorators | stateless、srcmac (in/bitmask)、dstmac、vlan、rateexceed |
+| Extension rules | macspoof / ipspoof / nodhcp / nora / nondp / mcast_limit / isolated / disable / ctinvdrop |
+| Decorators | stateless、srcmac (in/bitmask)、dstmac、vlan、rateexceed、ct new |
 | Cross-feature | macspoof + ipspoof 組合、單獨啟用時不誤擋 |
-| PVE native | ICMP、SSH macro、ipset match+nomatch、cluster alias |
-| OVS parity | 同樣場景在 OVS bridge 上跑一遍 |
+| PVE native | ICMP、SSH macro、ipset match+nomatch、cluster alias / ipset |
+| OVS parity | basic ICMP、macspoof+ipspoof、ipset nomatch 在 OVS bridge 上跑一遍 |
 | Quarantine | OVS icmp family 衝突、nft ipset 家族衝突、使用者修好再 apply 會恢復 |
 
-開發期在 pvefw-neo 主機上 `bash tests/setup.sh && bash tests/test.sh` 即可全跑一次。
+開發期在 pvefw-neo 主機上 `python3 tests/setup.py && python3 tests/test.py` 即可全跑一次，
+跑完 `python3 tests/clean.py` 還原。可用 env var 覆寫設定，例如
+`TEMPLATE_VMID=9000 BR_LINUX=vmbr20 LINUX_SUBNET_PREFIX=10.50 N_SLOTS=4 python3 tests/setup.py`。
