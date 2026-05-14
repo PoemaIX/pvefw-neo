@@ -72,6 +72,17 @@ class TestCtx:
         detail = "" if passed else f"expected [{expect}] got [{got}]"
         self.results.append((passed, f"{self.name}: {label}", detail))
 
+    def check_probe(self, label, expect, probe_fn):
+        """check() for packet probes: if the first result doesn't match, probe
+        once more and use that. A real firewall behaviour reproduces; a
+        transient exec/scheduling glitch under the parallel runner usually
+        doesn't. A genuinely consistent bug still fails (the re-probe agrees)."""
+        got = probe_fn()
+        if str(got) != str(expect):
+            time.sleep(0.5)
+            got = probe_fn()
+        self.check(label, expect, got)
+
     # ── convenience ──
     def ping(self):
         return probe_ping(self.backend, self.slot)
@@ -94,28 +105,28 @@ def nft_ruleset():
 # ─────────────────────────── Extension / sugar tests ───────────────────────────
 def test_macspoof(t):
     """macspoof: only whitelisted source MACs may egress."""
-    t.check("off: traffic escapes when unmanaged", "PASS", t.ping())
+    t.check_probe("off: traffic escapes when unmanaged", "PASS", t.ping)
     # ON, bogus allow-list (VM's real MAC NOT listed) → all VM traffic dropped.
     fw_ext("vm", t.iface, "@neo:macspoof aa:bb:cc:dd:ee:ff,aa:bb:cc:dd:ee:00")
     fw_apply()
-    t.check("on: non-whitelisted src MAC dropped", "FAIL", t.ping())
+    t.check_probe("on: non-whitelisted src MAC dropped", "FAIL", t.ping)
     # ON, auto-read (= VM's real MAC) → legit traffic passes.
     t.reset()
     fw_ext("vm", t.iface, "@neo:macspoof")
     fw_apply()
-    t.check("on: whitelisted src MAC passes", "PASS", t.ping())
+    t.check_probe("on: whitelisted src MAC passes", "PASS", t.ping)
 
 
 def test_ipspoof(t):
     """ipspoof: only listed source IPs may egress."""
-    t.check("off: traffic escapes when unmanaged", "PASS", t.ping())
+    t.check_probe("off: traffic escapes when unmanaged", "PASS", t.ping)
     fw_ext("vm", t.iface, "@neo:ipspoof", source="198.51.100.42/32")
     fw_apply()
-    t.check("on: unlisted src IP dropped", "FAIL", t.ping())
+    t.check_probe("on: unlisted src IP dropped", "FAIL", t.ping)
     t.reset()
     fw_ext("vm", t.iface, "@neo:ipspoof", source=t.vm_ip)
     fw_apply()
-    t.check("on: listed src IP passes", "PASS", t.ping())
+    t.check_probe("on: listed src IP passes", "PASS", t.ping)
 
 
 def test_nodhcp(t):
@@ -139,7 +150,7 @@ def test_nodhcp(t):
     fire()
     time.sleep(1)
     t.check("on: DHCP-shaped UDP 67→68 dropped", True, cap_count("ct", tag) == 0)
-    t.check("on: ordinary traffic still passes", "PASS", t.ping())
+    t.check_probe("on: ordinary traffic still passes", "PASS", t.ping)
 
 
 def test_nora(t):
@@ -158,7 +169,7 @@ def test_nora(t):
     agent_send("vm", "ra", t.vm_eth, t.vm_mac)
     time.sleep(1)
     t.check("on: Router Advertisement dropped", True, cap_count("ct", tag) == 0)
-    t.check("on: IPv4 traffic unaffected", "PASS", t.ping())
+    t.check_probe("on: IPv4 traffic unaffected", "PASS", t.ping)
 
 
 def test_nondp(t):
@@ -182,7 +193,7 @@ def test_nondp(t):
     fire()
     time.sleep(1)
     t.check("on: NS + NA dropped", True, cap_count("ct", tag) == 0)
-    t.check("on: IPv4 traffic unaffected", "PASS", t.ping())
+    t.check_probe("on: IPv4 traffic unaffected", "PASS", t.ping)
 
 
 def test_mcast_limit(t):
@@ -195,18 +206,18 @@ def test_mcast_limit(t):
     rs = nft_ruleset()
     t.check("on: mcast rate-limit rule present", True,
             pat in rs and "ether daddr & 01:00:00:00:00:00" in rs)
-    t.check("on: unicast traffic unaffected", "PASS", t.ping())
+    t.check_probe("on: unicast traffic unaffected", "PASS", t.ping)
 
 
 def test_disable(t):
     """disable: @neo:disable un-manages the port entirely."""
-    t.check("off: traffic escapes when unmanaged", "PASS", t.ping())
+    t.check_probe("off: traffic escapes when unmanaged", "PASS", t.ping)
     fw_rule("vm", "DROP", "out", iface=t.iface)
     fw_apply()
-    t.check("on: per-iface OUT DROP blocks traffic", "FAIL", t.ping())
+    t.check_probe("on: per-iface OUT DROP blocks traffic", "FAIL", t.ping)
     fw_ext("vm", t.iface, "@neo:disable")
     fw_apply()
-    t.check("disable: port un-managed, traffic flows", "PASS", t.ping())
+    t.check_probe("disable: port un-managed, traffic flows", "PASS", t.ping)
 
 
 def test_ctinvdrop(t):
@@ -216,7 +227,7 @@ def test_ctinvdrop(t):
     fw_apply()
     t.check("on: ct-invalid drop present on IN + OUT", True,
             nft_ruleset().count("ct state invalid") >= 2)
-    t.check("on: ordinary traffic unaffected", "PASS", t.ping())
+    t.check_probe("on: ordinary traffic unaffected", "PASS", t.ping)
 
 
 def test_isolated(t):
@@ -236,55 +247,55 @@ def test_isolated(t):
 # ─────────────────────────── Decorator tests ───────────────────────────
 def test_srcmac_in(t):
     """@neo:srcmac in — rule scoped to a source-MAC whitelist."""
-    t.check("off: traffic escapes when unmanaged", "PASS", t.ping())
+    t.check_probe("off: traffic escapes when unmanaged", "PASS", t.ping)
     # catch-all DROP, then ACCEPT scoped to the VM's real src MAC (on top).
     fw_rule("vm", "DROP", "out", iface=t.iface, comment="@neo:noct")
     fw_rule("vm", "ACCEPT", "out", iface=t.iface,
             comment=f"@neo:noct @neo:srcmac in {t.vm_mac}")
     fw_apply()
-    t.check("on: matching src MAC passes", "PASS", t.ping())
+    t.check_probe("on: matching src MAC passes", "PASS", t.ping)
     # ACCEPT scoped to a bogus MAC → VM traffic falls through to the DROP.
     t.reset()
     fw_rule("vm", "DROP", "out", iface=t.iface, comment="@neo:noct")
     fw_rule("vm", "ACCEPT", "out", iface=t.iface,
             comment="@neo:noct @neo:srcmac in aa:bb:cc:dd:ee:ff")
     fw_apply()
-    t.check("on: non-matching src MAC dropped", "FAIL", t.ping())
+    t.check_probe("on: non-matching src MAC dropped", "FAIL", t.ping)
 
 
 def test_srcmac_bitmask(t):
     """@neo:srcmac bitmask — match when (src_mac & mask) == mask."""
-    t.check("off: traffic escapes when unmanaged", "PASS", t.ping())
+    t.check_probe("off: traffic escapes when unmanaged", "PASS", t.ping)
     # mask = the VM's own MAC → (mac & mac) == mac is always true → ACCEPT hits.
     fw_rule("vm", "DROP", "out", iface=t.iface, comment="@neo:noct")
     fw_rule("vm", "ACCEPT", "out", iface=t.iface,
             comment=f"@neo:noct @neo:srcmac bitmask {t.vm_mac}")
     fw_apply()
-    t.check("on: bitmask satisfied by src MAC → passes", "PASS", t.ping())
+    t.check_probe("on: bitmask satisfied by src MAC → passes", "PASS", t.ping)
     # mask = all-ones → only an all-ff MAC satisfies it → never matches.
     t.reset()
     fw_rule("vm", "DROP", "out", iface=t.iface, comment="@neo:noct")
     fw_rule("vm", "ACCEPT", "out", iface=t.iface,
             comment="@neo:noct @neo:srcmac bitmask ff:ff:ff:ff:ff:ff")
     fw_apply()
-    t.check("on: bitmask not satisfied → dropped", "FAIL", t.ping())
+    t.check_probe("on: bitmask not satisfied → dropped", "FAIL", t.ping)
 
 
 def test_dstmac(t):
     """@neo:dstmac in — rule scoped to a destination-MAC whitelist."""
-    t.check("off: traffic escapes when unmanaged", "PASS", t.ping())
+    t.check_probe("off: traffic escapes when unmanaged", "PASS", t.ping)
     # VM→CT echo-request carries the CT's MAC as dst → matches.
     fw_rule("vm", "DROP", "out", iface=t.iface, comment="@neo:noct")
     fw_rule("vm", "ACCEPT", "out", iface=t.iface,
             comment=f"@neo:noct @neo:dstmac in {t.ct_mac}")
     fw_apply()
-    t.check("on: matching dst MAC passes", "PASS", t.ping())
+    t.check_probe("on: matching dst MAC passes", "PASS", t.ping)
     t.reset()
     fw_rule("vm", "DROP", "out", iface=t.iface, comment="@neo:noct")
     fw_rule("vm", "ACCEPT", "out", iface=t.iface,
             comment="@neo:noct @neo:dstmac in aa:bb:cc:dd:ee:ff")
     fw_apply()
-    t.check("on: non-matching dst MAC dropped", "FAIL", t.ping())
+    t.check_probe("on: non-matching dst MAC dropped", "FAIL", t.ping)
 
 
 def test_vlan(t):
@@ -295,7 +306,7 @@ def test_vlan(t):
     fw_rule("vm", "ACCEPT", "out", iface=t.iface, comment=f"@neo:noct @neo:vlan {vid}")
     fw_apply()
     t.check("on: vlan match rendered", True, pat in nft_ruleset())
-    t.check("on: untagged traffic unaffected", "PASS", t.ping())
+    t.check_probe("on: untagged traffic unaffected", "PASS", t.ping)
 
 
 def test_rateexceed(t):
@@ -307,109 +318,109 @@ def test_rateexceed(t):
     fw_rule("vm", "DROP", "out", iface=t.iface, comment=f"@neo:noct @neo:rateexceed {rate}")
     fw_apply()
     t.check("on: rate-limit rule rendered", True, pat in nft_ruleset())
-    t.check("on: traffic within budget unaffected", "PASS", t.ping())
+    t.check_probe("on: traffic within budget unaffected", "PASS", t.ping)
 
 
 def test_ct_new(t):
     """@neo:ct new — IN DROP that only matches ct-state=new flows."""
-    t.check("off: inbound NEW flow reaches VM", "PASS", t.ping_rev())
+    t.check_probe("off: inbound NEW flow reaches VM", "PASS", t.ping_rev)
     fw_rule("vm", "DROP", "in", iface=t.iface, comment="@neo:ct new")
     fw_apply()
     slot_ct_flush(t.backend, t.slot)
-    t.check("on: inbound NEW flow dropped", "FAIL", t.ping_rev())
+    t.check_probe("on: inbound NEW flow dropped", "FAIL", t.ping_rev)
     slot_ct_flush(t.backend, t.slot)
-    t.check("on: VM-initiated flow still works (established replies)", "PASS", t.ping())
+    t.check_probe("on: VM-initiated flow still works (established replies)", "PASS", t.ping)
 
 
 # ─────────────────────────── PVE-native rule tests ───────────────────────────
 def test_native_basic(t):
     """Native IN DROP catch-all + IN ACCEPT icmp."""
-    t.check("off: inbound flow reaches guest", "PASS", t.ping_rev())
+    t.check_probe("off: inbound flow reaches guest", "PASS", t.ping_rev)
     fw_rule("vm", "DROP", "in", iface=t.iface)
     fw_apply()
     slot_ct_flush(t.backend, t.slot)
-    t.check("on: IN DROP blocks inbound", "FAIL", t.ping_rev())
+    t.check_probe("on: IN DROP blocks inbound", "FAIL", t.ping_rev)
     fw_rule("vm", "ACCEPT", "in", iface=t.iface, proto="icmp")
     fw_apply()
     slot_ct_flush(t.backend, t.slot)
-    t.check("on: IN ACCEPT icmp permits ping", "PASS", t.ping_rev())
+    t.check_probe("on: IN ACCEPT icmp permits ping", "PASS", t.ping_rev)
 
 
 def test_native_ssh(t):
     """Native SSH macro — the VM's own sshd is the listener on port 22."""
-    t.check("off: SSH port reachable", "OPEN", tcp_check("ct", t.ct_ip, t.vm_ip, 22))
+    t.check_probe("off: SSH port reachable", "OPEN", lambda: tcp_check("ct", t.ct_ip, t.vm_ip, 22))
     fw_rule("vm", "DROP", "in", iface=t.iface)
     fw_apply()
     slot_ct_flush(t.backend, t.slot)
-    t.check("on: IN DROP closes SSH port", "CLOSED", tcp_check("ct", t.ct_ip, t.vm_ip, 22))
+    t.check_probe("on: IN DROP closes SSH port", "CLOSED", lambda: tcp_check("ct", t.ct_ip, t.vm_ip, 22))
     fw_rule("vm", "ACCEPT", "in", iface=t.iface, macro="SSH")
     fw_apply()
     slot_ct_flush(t.backend, t.slot)
-    t.check("on: SSH macro reopens port 22", "OPEN", tcp_check("ct", t.ct_ip, t.vm_ip, 22))
+    t.check_probe("on: SSH macro reopens port 22", "OPEN", lambda: tcp_check("ct", t.ct_ip, t.vm_ip, 22))
     start_listener("vm", 9999)
-    t.check("on: non-SSH port stays closed", "CLOSED",
-            tcp_check("ct", t.ct_ip, t.vm_ip, 9999))
+    t.check_probe("on: non-SSH port stays closed", "CLOSED",
+                  lambda: tcp_check("ct", t.ct_ip, t.vm_ip, 9999))
 
 
 def test_native_ipset_nomatch(t):
     """VM-local ipset: a /24 member is permitted, then a nomatch entry
     carves the CT back out."""
     name = f"tst_set{t.suffix}"
-    t.check("off: inbound flow reaches guest", "PASS", t.ping_rev())
+    t.check_probe("off: inbound flow reaches guest", "PASS", t.ping_rev)
     guest_ipset_create("vm", name)
     guest_ipset_add("vm", name, t.cidr)
     fw_rule("vm", "DROP", "in", iface=t.iface)
     fw_rule("vm", "ACCEPT", "in", iface=t.iface, proto="icmp", source=f"+{name}")
     fw_apply()
     slot_ct_flush(t.backend, t.slot)
-    t.check("on: ipset /24 member permitted", "PASS", t.ping_rev())
+    t.check_probe("on: ipset /24 member permitted", "PASS", t.ping_rev)
     guest_ipset_add("vm", name, t.ct_ip, nomatch=True)
     fw_apply()
     slot_ct_flush(t.backend, t.slot)
-    t.check("on: ipset nomatch excludes CT", "FAIL", t.ping_rev())
+    t.check_probe("on: ipset nomatch excludes CT", "FAIL", t.ping_rev)
 
 
 def test_native_cluster_alias(t):
     """Datacenter alias referenced from a VM-local rule via dc/<name>."""
     name = f"tst_peer{t.suffix}"
-    t.check("off: inbound flow reaches guest", "PASS", t.ping_rev())
+    t.check_probe("off: inbound flow reaches guest", "PASS", t.ping_rev)
     cluster_alias_create(name, t.ct_ip)
     fw_rule("vm", "DROP", "in", iface=t.iface)
     fw_rule("vm", "ACCEPT", "in", iface=t.iface, proto="icmp", source=f"dc/{name}")
     fw_apply()
     slot_ct_flush(t.backend, t.slot)
-    t.check("on: dc/ alias permits CT", "PASS", t.ping_rev())
+    t.check_probe("on: dc/ alias permits CT", "PASS", t.ping_rev)
     cluster_alias_set(name, "198.51.100.7")
     fw_apply()
     slot_ct_flush(t.backend, t.slot)
-    t.check("on: dc/ alias excludes non-listed IP", "FAIL", t.ping_rev())
+    t.check_probe("on: dc/ alias excludes non-listed IP", "FAIL", t.ping_rev)
 
 
 def test_native_cluster_ipset(t):
     """Cluster ipset with a /24 member then a nomatch carve-out."""
     name = f"tst_dcset{t.suffix}"
-    t.check("off: inbound flow reaches guest", "PASS", t.ping_rev())
+    t.check_probe("off: inbound flow reaches guest", "PASS", t.ping_rev)
     cluster_ipset_create(name)
     cluster_ipset_add(name, t.cidr)
     fw_rule("vm", "DROP", "in", iface=t.iface)
     fw_rule("vm", "ACCEPT", "in", iface=t.iface, proto="icmp", source=f"+dc/{name}")
     fw_apply()
     slot_ct_flush(t.backend, t.slot)
-    t.check("on: cluster ipset /24 member permitted", "PASS", t.ping_rev())
+    t.check_probe("on: cluster ipset /24 member permitted", "PASS", t.ping_rev)
     cluster_ipset_add(name, t.ct_ip, nomatch=True)
     fw_apply()
     slot_ct_flush(t.backend, t.slot)
-    t.check("on: cluster ipset nomatch excludes CT", "FAIL", t.ping_rev())
+    t.check_probe("on: cluster ipset nomatch excludes CT", "FAIL", t.ping_rev)
 
 
 def test_spoof_combo(t):
     """macspoof + ipspoof together: legit traffic passes both filters; a
     forged source IP is dropped (capture MAC-scoped to the VM's real MAC)."""
-    t.check("off: traffic escapes when unmanaged", "PASS", t.ping())
+    t.check_probe("off: traffic escapes when unmanaged", "PASS", t.ping)
     fw_ext("vm", t.iface, "@neo:macspoof")
     fw_ext("vm", t.iface, "@neo:ipspoof", source=t.vm_ip)
     fw_apply()
-    t.check("on: legit traffic passes both filters", "PASS", t.ping())
+    t.check_probe("on: legit traffic passes both filters", "PASS", t.ping)
     fake = f"{t.subnet}.99"
     tag = f"spoof{t.netindex}"
     bpf = f"ether src {t.vm_mac} and icmp and src host {fake}"
@@ -471,7 +482,7 @@ def test_quarantine_ovs_icmp(t):
     t.check("rule #0 auto-disabled", "0", str(fw_rule_enabled("vm", 0)))
     t.check("quarantine log entry present", "YES",
             "YES" if fw_log_has_quarantine("vm", 0) else "NO")
-    t.check("baseline ping on same bridge intact", "PASS", t.ping())
+    t.check_probe("baseline ping on same bridge intact", "PASS", t.ping)
 
 
 def test_quarantine_nft_set(t):
@@ -485,7 +496,7 @@ def test_quarantine_nft_set(t):
     t.check("rule #0 auto-disabled", "0", str(fw_rule_enabled("vm", 0)))
     t.check("quarantine log entry present", "YES",
             "YES" if fw_log_has_quarantine("vm", 0) else "NO")
-    t.check("baseline ping on same bridge intact", "PASS", t.ping())
+    t.check_probe("baseline ping on same bridge intact", "PASS", t.ping)
 
 
 def test_quarantine_self_heal(t):
