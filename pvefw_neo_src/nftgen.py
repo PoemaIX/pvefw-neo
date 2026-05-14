@@ -26,13 +26,17 @@ from . import ir
 # Public API
 # ═══════════════════════════════════════
 
-def render(ruleset, devnames=None):
+def render(ruleset, devnames=None, existing_netdev_tables=None):
     """Render IR Ruleset → nftables text + isolated devices list.
 
     Args:
       ruleset: ir.Ruleset
       devnames: optional iterable of devnames to include.
                 If None, include all NetDevs in ruleset.
+      existing_netdev_tables: names of `pvefw-neo-*` netdev tables currently
+                live in the kernel. Their deletes are emitted into this same
+                script so the whole apply is one atomic `nft -f` transaction —
+                no window where a port's L2 filter is briefly missing.
 
     Returns:
       (nft_text, isolated_devs) where isolated_devs is a list of devnames
@@ -40,7 +44,7 @@ def render(ruleset, devnames=None):
     """
     if devnames is None:
         devnames = list(ruleset.netdevs.keys())
-    return NftRenderer(ruleset, set(devnames)).render()
+    return NftRenderer(ruleset, set(devnames), existing_netdev_tables).render()
 
 
 # ═══════════════════════════════════════
@@ -48,9 +52,12 @@ def render(ruleset, devnames=None):
 # ═══════════════════════════════════════
 
 class NftRenderer:
-    def __init__(self, ruleset, devnames):
+    def __init__(self, ruleset, devnames, existing_netdev_tables=None):
         self.rs = ruleset
         self.devnames = devnames  # set
+        # Names of pvefw-neo-* netdev tables currently live in the kernel —
+        # deleted atomically (in-script) so the apply has no missing-filter gap.
+        self.existing_netdev_tables = set(existing_netdev_tables or [])
         # Per-device netdev rules (pure-L2 stateless)
         self._netdev_rules = {}    # devname → [str]
         # Bridge raw chain rules
@@ -224,14 +231,20 @@ class NftRenderer:
         Handles PVE WebUI names including sub-types (e.g. network-unreachable
         = type 3/code 0) and ICMPv6 name translation (PVE router-solicitation
         → nft nd-router-solicit).
+
+        Multiple bare type names are OR-matched via an anonymous set
+        (`icmpv6 type { a, b }`). Emitting them as separate `type a type b`
+        clauses would AND them — a packet can't be two types at once, so the
+        rule would never match (this broke @neo:nondp).
         """
         table = icmp_types.ICMPV6 if v6 else icmp_types.ICMPV4
         keyword = "icmpv6" if v6 else "icmp"
-        parts = []
+        simple = []   # bare type names — OR-able together in one set
+        coded = []    # type+code pairs — must stay as separate clauses
         for name in types:
             entry = table.get(name)
             if entry is None:
-                parts.append(f"{keyword} type {name}")
+                simple.append(name)
                 continue
             typ, code = entry
             if typ is None:
@@ -239,12 +252,18 @@ class NftRenderer:
             if v6:
                 nft_name = icmp_types.NFT_ICMPV6_NAME.get(name)
                 if nft_name and code is None:
-                    parts.append(f"{keyword} type {nft_name}")
+                    simple.append(nft_name)
                     continue
             if code is not None:
-                parts.append(f"{keyword} type {typ} {keyword} code {code}")
+                coded.append(f"{keyword} type {typ} {keyword} code {code}")
             else:
-                parts.append(f"{keyword} type {name}")
+                simple.append(name)
+        parts = []
+        if len(simple) == 1:
+            parts.append(f"{keyword} type {simple[0]}")
+        elif simple:
+            parts.append(f"{keyword} type {{ {', '.join(simple)} }}")
+        parts.extend(coded)
         return parts
 
     @staticmethod
@@ -297,6 +316,27 @@ class NftRenderer:
             # bridge raw_prerouting (needs iif/oif prefix)
             iface_prefix = self._iface_prefix(devname, rule.direction)
             self._raw_rules.append(f"{iface_prefix} {line}")
+
+        na_line = self._companion_na_target_rule(rule)
+        if na_line:
+            iface_prefix = self._iface_prefix(devname, rule.direction)
+            self._raw_rules.append(f"{iface_prefix} {na_line}")
+
+    def _companion_na_target_rule(self, rule):
+        """DISABLED — no working nftables syntax to match the NDP
+        Neighbour-Advertisement *target* address against an ipv6_addr set.
+
+        `nd na target` is not an nft keyword; the raw-payload form
+        (`@th,64,128`) is integer-typed and can't be compared to an
+        ipv6_addr set ("datatype mismatch"). The previous implementation
+        emitted a rule nft rejected, which quarantined every @neo:ipspoof
+        rule on the port.
+
+        The OVS backend keeps its NA-target companion (OpenFlow has a real
+        `nd_target` field) — only the nft path is affected.
+        TODO: revisit if nftables gains a first-class NDP target match.
+        """
+        return None
 
     def _handle_stateful(self, devname, netdev, rule):
         """STATEFUL rule → per-(devname, direction) sub-chain.
@@ -370,11 +410,21 @@ class NftRenderer:
         lines.append("# Generated by pvefw-neo (new IR backend)")
         lines.append("")
 
-        # Flush bridge table (netdev tables are cleaned up in main.apply_ruleset
-        # before this script runs, to handle disabled / removed ports).
-        lines.append("# Flush existing pvefw-neo bridge table")
+        # ── Atomic table reset ──
+        # All of this is fed to one `nft -f`, so deletes + recreates land in a
+        # single transaction. A previous design pre-deleted the netdev tables
+        # in a separate `nft` pass — that left a brief window where a port's
+        # L2 filter (macspoof/mcast_limit) was missing and packets leaked.
+        lines.append("# Flush existing pvefw-neo tables (atomic with recreate)")
         lines.append("table bridge pvefw-neo")
         lines.append("delete table bridge pvefw-neo")
+        # Delete the union of {netdev tables currently live} ∪ {about to be
+        # recreated}. The bare `table netdev X` line first ensures it exists,
+        # so the `delete` is safe even for a table that isn't there.
+        new_netdev = {f"pvefw-neo-{d}" for d in self._netdev_rules}
+        for tbl in sorted(self.existing_netdev_tables | new_netdev):
+            lines.append(f"table netdev {tbl}")
+            lines.append(f"delete table netdev {tbl}")
         lines.append("")
 
         # ── Netdev tables (per-device pure-L2 stateless) ──
@@ -438,16 +488,14 @@ class NftRenderer:
         )
         # Skip rules entirely if no NetDev has STATEFUL rules
         if self._stateful_devs:
-            # Ports with ONLY stateless rules (sugar tags) don't need ct.
-            # Early-accept them before the ct framework so their traffic
-            # never triggers a conntrack lookup.
-            all_managed = {dn for dn in self.rs.netdevs
-                           if dn in self.devnames
-                           and not self.rs.netdevs[dn].disabled}
-            non_stateful = sorted(all_managed - self._stateful_devs)
-            for dn in non_stateful:
-                lines.append(f'        iifname "{dn}" accept')
-                lines.append(f'        oifname "{dn}" accept')
+            # NOTE: do NOT early-accept ports that have only stateless rules
+            # (or none). A blanket `iifname/oifname <dn> accept` here would
+            # short-circuit the *peer* port's stateful rules — a packet
+            # between an unmanaged port and a port carrying an IN/OUT DROP
+            # would be accepted on the unmanaged port's line before the DROP
+            # could ever match. Stateless rules already run in raw_prerouting;
+            # this traffic falls through to the per-port dispatch (and
+            # otherwise to `policy accept`), which is both correct and cheap.
 
             # ARP pass-through (so MAC learning works)
             lines.append("        ether type arp accept")

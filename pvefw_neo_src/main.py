@@ -185,26 +185,32 @@ def generate_and_check():
     return ir_rs, nft_text, isolated_devs, groups["ovs"]
 
 
-def _cleanup_orphaned_netdev_tables():
-    """Drop any leftover `table netdev pvefw-neo-*` — they'd otherwise
-    accumulate from ports that used to be managed but aren't now (e.g.
-    @neo:disable, firewall=1 added, VM deleted). Safe to run before every
-    apply: tables we're about to recreate get replaced with fresh content.
+def _existing_pvefw_netdev_tables():
+    """Names of `pvefw-neo-*` netdev tables currently live in the kernel.
+
+    Handed to the renderer so their deletes are emitted into the same
+    `nft -f` script as the recreate — one atomic transaction, no window
+    where a port's L2 filter is missing. (Deleting them in a separate `nft`
+    pass beforehand had exactly that race: a concurrent apply could blank a
+    port's macspoof/mcast_limit filter for a few ms and leak packets.)
+
+    Also covers orphans — tables for ports that used to be managed but
+    aren't now (@neo:disable, firewall=1 added, VM deleted) — since those
+    names are live but absent from the new ruleset.
     """
     ret = subprocess.run(
         ["nft", "list", "tables"],
         capture_output=True, text=True,
     )
     if ret.returncode != 0:
-        return
+        return []
+    names = []
     for line in ret.stdout.splitlines():
         parts = line.strip().split()
         if len(parts) == 3 and parts[0] == "table" and parts[1] == "netdev" \
                 and parts[2].startswith("pvefw-neo-"):
-            subprocess.run(
-                ["nft", "delete", "table", "netdev", parts[2]],
-                capture_output=True, text=True,
-            )
+            names.append(parts[2])
+    return names
 
 
 def _host_ovs_bridges():
@@ -237,12 +243,17 @@ def apply_ruleset(ir_rs):
     all_bridges = sorted(set(groups["ovs"].keys()) | _host_ovs_bridges())
     ovs_targets = [(br, groups["ovs"].get(br, [])) for br in all_bridges]
 
+    # Snapshot the live pvefw-neo netdev tables once: the renderer folds their
+    # deletes into the same atomic `nft -f` as the recreate. A failed `nft -f`
+    # rolls back fully, so this stays accurate across quarantine retries.
+    existing_netdev = _existing_pvefw_netdev_tables()
+
     # Stash the final rendered nft text so the caller can cache it for
     # change detection. Closure receives filtered IR each quarantine round.
     final_text = {"nft": "", "isolated": []}
 
     def nft_render(filtered):
-        text, iso = nftgen.render(filtered, groups["linux"])
+        text, iso = nftgen.render(filtered, groups["linux"], existing_netdev)
         final_text["nft"] = text
         final_text["isolated"] = iso
         return text, iso
@@ -253,7 +264,7 @@ def apply_ruleset(ir_rs):
         ruleset_path=RULESET_PATH,
         ovs_bridges=ovs_targets,
         isolation_hook=bridge.apply_isolation,
-        pre_nft_hook=_cleanup_orphaned_netdev_tables,
+        pre_nft_hook=None,  # netdev-table deletes are now in-script (atomic)
     )
 
     if not ok:
