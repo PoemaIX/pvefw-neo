@@ -36,6 +36,17 @@ def is_ipv6(addr):
         return False
 
 
+def mac_to_eui64_ll(mac):
+    """Convert MAC address to EUI-64 link-local IPv6 (fe80::…/128)."""
+    octets = mac.replace("-", ":").split(":")
+    if len(octets) != 6:
+        return None
+    b = [int(o, 16) for o in octets]
+    b[0] ^= 0x02
+    eui64 = f"{b[0]:02x}{b[1]:02x}:{b[2]:02x}ff:fe{b[3]:02x}:{b[4]:02x}{b[5]:02x}"
+    return f"fe80::{eui64}/128"
+
+
 def normalize_port(port_str):
     """Normalize PVE port spec: '80:443' → '80-443', '80,443' → '{80,443}'."""
     if not port_str:
@@ -301,6 +312,21 @@ class Compiler:
 
         l3_afs = src_fam or dst_fam  # None if both null; else the agreed fam
 
+        # proto pins the family too: icmp → v4, icmpv6 → v6. A rule that says
+        # `-p icmpv6` but carries a v4 src/dst (or `@neo:ether ip`, checked in
+        # Step 2) is nonsensical — backends would emit a flow that silently
+        # never matches instead of rejecting it.
+        proto = (rule.proto or "").lower()
+        proto_fam = {"icmp": "v4", "icmpv6": "v6",
+                     "icmp6": "v6", "ipv6-icmp": "v6"}.get(proto)
+        if proto_fam:
+            if l3_afs and l3_afs not in (proto_fam, "mixed"):
+                self._reject_rule(vmid, rule,
+                    f"proto '{proto}' (family {proto_fam}) conflicts with "
+                    f"l3 family '{l3_afs}'")
+                return False
+            l3_afs = proto_fam   # proto narrows None / mixed to a concrete fam
+
         # Step 2: intersect with @neo:ether.
         ether_tag = rule.get_neo_tag("ether")
         ether_val = (ether_tag.args[0].lower()
@@ -365,8 +391,9 @@ class Compiler:
             ))
 
     def _sugar_ipspoof(self, vmid, config, nets, is_ct, rule, tag):
-        """@neo:ipspoof → 3 conditional-drop rules per port (ARP / v4 / v6)
-        each referencing a pure-nomatch NamedSet carrying the allow-list.
+        """@neo:ipspoof [eui64] → 3 conditional-drop rules per port
+        (ARP / v4 / v6), each referencing a pure-nomatch NamedSet carrying
+        the allow-list.
 
         The emitted IR shape is identical to what a user would get by
         hand-writing:
@@ -374,7 +401,7 @@ class Compiler:
             [IPSET ipspoof_vm<id>_<iface>_v4]
               !10.0.0.10
             [IPSET ipspoof_vm<id>_<iface>_v6]
-              !fe80::/10
+              !fe80::/10   (or !fe80::eui64/128 when eui64 flag set)
               !::0
               !2001:db8::1
             [RULES]
@@ -382,12 +409,29 @@ class Compiler:
               |OUT DROP -p ip  -source +ipspoof_..._v4  # @neo:notrack (IPv4)
               |OUT DROP -p ip6 -source +ipspoof_..._v6  # @neo:notrack (IPv6)
 
+        The IPv6 rule carries `ether_type=ip6 + src_set` — backends
+        automatically emit a companion NA-target filter so that Neighbor
+        Advertisement target addresses are also validated against the same
+        allow-list (prevents DAD spoofing).
+
         IP list comes from either `rule.source` (preferred; put IPs in the
         WebUI Source field) or legacy tag args (`# @neo:ipspoof a,b,c`).
+
+        Optional `eui64` flag (2nd arg or standalone):
+          `@neo:ipspoof 10.0.0.1 eui64` or `@neo:ipspoof eui64` (with Source)
+        When set, use fe80::<EUI-64>/128 derived from the port's MAC instead
+        of the permissive fe80::/10.
+
         Sugar disappears in IR — only sets + rules referencing them remain.
         """
-        if tag.args:
-            raw = tag.args[0]
+        use_eui64 = False
+        args = list(tag.args)
+        if "eui64" in args:
+            use_eui64 = True
+            args.remove("eui64")
+
+        if args:
+            raw = args[0]
         elif rule.source:
             raw = rule.source
         else:
@@ -438,10 +482,16 @@ class Compiler:
                 ))
 
             # ── v6 pure-nomatch set ──
-            # Always include link-local (fe80::/10) and DAD (::) so the
-            # VM can do Neighbor Discovery even if the user only listed
-            # v4 addresses.
-            v6_allow = list(v6) + ["fe80::/10", "::"]
+            # Include link-local + DAD so the VM can do NDP.
+            # With eui64: derive specific fe80::<EUI-64>/128 from MAC.
+            # Without: permissive fe80::/10.
+            if use_eui64:
+                port_mac = nets.get(iface, {}).get("mac", "")
+                ll = mac_to_eui64_ll(port_mac)
+                v6_ll = [ll] if ll else ["fe80::/10"]
+            else:
+                v6_ll = ["fe80::/10"]
+            v6_allow = list(v6) + v6_ll + ["::"]
             self.sets[set_v6] = ir.NamedSet(
                 name=set_v6, family="ipv6",
                 elements=[], excludes=v6_allow,
