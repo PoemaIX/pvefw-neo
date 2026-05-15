@@ -184,54 +184,58 @@ def _install_meters(bridge, meters):
 
 
 def apply(ruleset, bridge, devnames=None):
-    """Render and atomically apply flows + meters to an OVS bridge.
+    """Render and apply flows + meters to an OVS bridge.
 
-    Order: delete-old-meters → delete-old-flows → install-new-meters →
-    install-new-flows. Meters first so flows that reference them don't
-    race with a half-installed meter set.
+    The flow swap — delete-ours + add-new — is ONE atomic `ovs-ofctl
+    --bundle` transaction. There is no window where the bridge has lost its
+    pvefw-neo flows (a separate `del-flows` then `add-flows` left exactly
+    that gap, through which OVS-port traffic fell back to plain NORMAL
+    forwarding — i.e. the firewall was briefly off).
+
+    Meters are handled before the bundle: ovs-ofctl can't carry meter-mods
+    in a flow bundle, and the still-live old flows tolerate the brief
+    meter-set swap (it only affects rate-limited flows, not the verdict).
 
     Returns (ok, err_text, flows_text, cookie_map). err_text is the raw
     `ovs-ofctl` stderr on failure (empty on success). Callers use it to
     pinpoint which source_id caused a rejection (via cookie_map).
     """
+    import os
+
     flows_text, cookie_map, meters = render(ruleset, bridge, devnames)
 
-    # Any rule that needs a meter forces the whole bridge onto OF1.3
-    # (bridge-level protocol list) and we'll pass `-O OpenFlow13` to
-    # ovs-ofctl. No-meter bridges stay on the default (OF1.0) path for
-    # compatibility.
-    of_args = []
-    if meters:
-        _ensure_bridge_of13(bridge)
-        of_args = ["-O", "OpenFlow13"]
+    # `ovs-ofctl --bundle` needs OpenFlow 1.3+ — its default of OF1.4 fails to
+    # negotiate against a bridge capped at OF1.3, and PVE leaves OVS bridges
+    # at OF1.0-only. So always make the bridge advertise OF1.3 and pin
+    # `-O OpenFlow13` on the bundle call. (OF1.3 also covers meter refs.)
+    _ensure_bridge_of13(bridge)
+    of_args = ["-O", "OpenFlow13"]
 
-    # Always delete previous meters + flows with our magic prefix first.
+    # Meters first (they can't ride in the flow bundle). Old meters cleared;
+    # new ones installed before the flow bundle references them.
     _delete_our_meters(bridge)
-    mask_str = f"0x{COOKIE_PREFIX:016X}/0x{COOKIE_MASK:016X}"
-    subprocess.run(
-        ["ovs-ofctl", *of_args, "del-flows", bridge, f"cookie={mask_str}"],
-        capture_output=True, text=True,
-    )
-
-    if not flows_text.strip():
-        return True, "", flows_text, cookie_map
-
-    # Install meters BEFORE flows. If a meter install fails (bridge doesn't
-    # negotiate OF1.3, or meter subsystem unsupported) return the error so
-    # the quarantine layer can disable the owning rule.
     if meters:
         ok, err = _install_meters(bridge, meters)
         if not ok:
             return False, err, flows_text, cookie_map
 
-    flows_path = f"/run/pvefw-neo/ovs-{bridge}.flows"
-    import os
+    # Build one bundle file: delete every flow carrying our cookie prefix,
+    # then add the freshly-rendered flows. ovs-ofctl applies the whole file
+    # as a single atomic OpenFlow bundle.
+    mask_str = f"0x{COOKIE_PREFIX:016X}/0x{COOKIE_MASK:016X}"
+    bundle_lines = [f"delete cookie={mask_str}"]
+    for line in flows_text.splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            bundle_lines.append(f"add {line}")
+
+    bundle_path = f"/run/pvefw-neo/ovs-{bridge}.flows"
     os.makedirs("/run/pvefw-neo", exist_ok=True)
-    with open(flows_path, "w") as f:
-        f.write(flows_text)
+    with open(bundle_path, "w") as f:
+        f.write("\n".join(bundle_lines) + "\n")
 
     ret = subprocess.run(
-        ["ovs-ofctl", *of_args, "add-flows", bridge, flows_path],
+        ["ovs-ofctl", *of_args, "--bundle", "add-flows", bridge, bundle_path],
         capture_output=True, text=True,
     )
     if ret.returncode != 0:
@@ -750,7 +754,22 @@ class OvsRenderer:
                 [f"in_port={ofport}"] + base_parts,
                 "drop",
                 source_id=source_id))
-            return prio - 2
+            prio -= 2
+            # Companion NA target filter: for IPv6 src_set, also validate
+            # the ND NA target address against the same allow-list.
+            if (set_key == "src_set"
+                    and base.get("l2", {}).get("ether_type") == "ip6"):
+                na_base = [f"in_port={ofport}", "ipv6",
+                           "nw_proto=58", "icmpv6_type=136"]
+                for ip in ns.excludes:
+                    self.flows.append(self._emit(
+                        TBL_RAW, prio, na_base + [f"nd_target={ip}"],
+                        pass_action, source_id=source_id))
+                self.flows.append(self._emit(
+                    TBL_RAW, prio - 1, na_base, "drop",
+                    source_id=source_id))
+                prio -= 2
+            return prio
         return None
 
     @staticmethod
