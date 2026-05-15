@@ -25,9 +25,8 @@
     4. nora : 阻止發送 RA
 5. **pvefw-neo 不使用 `VM → Firewall → Options` 裡的任何 VM 級開關**
    （`policy_in`、`policy_out`、`dhcp`、`macfilter`、`ipfilter`、`ndp`、`radv`）。
-   只認那個分頁的 `Firewall` enable 切換。對應語意全部下放到 per-port
-   `@neo:` tag，也正是第 4 點能成立的基礎。想要某張 NIC 預設 drop？在那條
-   iface 的 rule 尾端自己加一條 `IN DROP -i netN` catch-all。
+   只認那個分頁的 `Firewall` enable 切換。  
+   對應語意全部下放到 per-port `@neo:` tag
 ---
 
 目前有以下限制:
@@ -105,8 +104,6 @@ daemon 會在數秒內偵測變動並重新套用。
 | `policy_in: DROP`  | `IN DROP` |
 | `policy_out: DROP` | `OUT DROP` |
 | `policy_in: REJECT` | `IN DROP`（bridge family 不支援 REJECT，見「限制」） |
-
-只想對某張 NIC 下 catch-all？填 Interface 就行：`IN DROP -iface net1`，不再 fan-out。
 
 **規則由上往下評估。** PVE WebUI 的 `Add` 每次都把新規則插在**最頂端**
 （pos 0），所以看得到的順序是「後加的在上、先加的在下」。catch-all 要先建：
